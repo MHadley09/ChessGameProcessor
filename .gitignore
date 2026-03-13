@@ -1,0 +1,5 @@
+.ipynb_checkpoints/chess_evaluator-checkpoint.py
+/.ipynb_checkpoints
+/__pycache__
+*.pgn
+*.db
