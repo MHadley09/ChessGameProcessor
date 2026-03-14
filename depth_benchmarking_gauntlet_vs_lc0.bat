@@ -4,7 +4,7 @@ echo Cutechess started at %date% %time%. Output is redirected to %outfile%
 echo Cutechess started at %date% %time% > %outfile%
 
 cutechess-cli.exe -tournament gauntlet -rounds 40 -games 2 -repeat -concurrency 8 -pgnout out_benchmark.pgn -recover ^
--resign movecount=20 score=10000 -draw movenumber=50 movecount=20 score=20 ^
+-resign movecount=20 score=1000 -draw movenumber=50 movecount=40 score=20 ^
 -openings file="books/book-ply8-unifen-Q-0.25-0.40.pgn" order=random plies=8 policy=round ^
 -engine name="Lc0" cmd="lc0" ^
 -engine name="Stockfish Baseline" cmd="stockfish-windows-x86-64" ^
