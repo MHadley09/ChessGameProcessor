@@ -4,3 +4,4 @@
 *.pgn
 *.db
 out_benchmark.txt
+*.db-journal

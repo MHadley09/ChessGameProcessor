@@ -73,10 +73,10 @@ def push_headers(queue, game, count):
     queue.add_query(query, [game_data]) #wrapped in array for execute many optimization on possible moves
 
 def parse_eval(eval):
-    if eval.type == "cp":
-        return (eval.value, None)
-    elif eval.type == "mate":
-        return (None, eval.value)
+    if eval['type'] == "cp":
+        return (eval['value'], None)
+    elif  eval['type'] == "mate":
+        return (None, eval['value'])
     else:
         return (None, None)
 
@@ -91,13 +91,13 @@ def get_possible_move(game_id, board, stockfish_move, fen_before):
     to_square = chess.square_name(move.to_square)
     promotion = None if move.promotion is None else chess.Piece(move.promotion, board.turn).symbol()
     piece = board.piece_at(chess.parse_square(from_square)).symbol()
+    color = "White" if board.turn == chess.WHITE else "Black"
 
     eval = stockfish_move.get("Centipawn", "None") 
     mate_count = stockfish_move.get("Mate", "None") 
 
     board.push(move)
     move_no_pair = board.fullmove_number
-    color = "White" if board.turn == chess.WHITE else "Black"
     move_no = board.ply()
     fen_after = board.fen()
     board.pop()
@@ -148,14 +148,14 @@ def push_move(queue, game_id, game, node, board, stockfish, moves_list):
     query = """
         INSERT INTO actual_moves (
             game_id, move_no, move_no_pair, player, notation, move, 
-            from_square, to_square, piece, color, fen_before, time_remaining, 
+            from_square, to_square, piece, color, fen_before, fen_after, time_remaining, 
             time_spent, game_to_position, white_win_perc_before, 
             black_win_perc_before, draw_perc_before, white_win_perc_after, 
             black_win_perc_after, draw_perc_after, static_eval_before, 
             static_eval_after, eval_before, mate_count_before, eval_after, 
             mate_count_after
         ) VALUES (:game_id, :move_no, :move_no_pair, :player, :notation, :move, 
-            :from_square, :to_square, :piece, :color, :fen_before, :time_remaining, 
+            :from_square, :to_square, :piece, :color, :fen_before, :fen_after, :time_remaining, 
             :time_spent, :game_to_position, :white_win_perc_before, 
             :black_win_perc_before, :draw_perc_before, :white_win_perc_after, 
             :black_win_perc_after, :draw_perc_after, :static_eval_before, 
@@ -168,7 +168,7 @@ def push_move(queue, game_id, game, node, board, stockfish, moves_list):
     
     perc_before = stockfish.get_wdl_stats(get_as_tuple=True)
     (white_win_perc_before, draw_perc_before, black_win_perc_before) = (None, None, None) if perc_before is None else perc_before
-    (eval_before, mate_count_before) = stockfish.get_evaluation()
+    (eval_before, mate_count_before) = parse_eval(stockfish.get_evaluation())
     
     push_possible_move_evals(queue, game_id, game, board, stockfish, fen_before)
     player = game.headers.get("White", "Unknown") if board.turn == chess.WHITE else game.headers.get("Black", "Unknown")
@@ -178,7 +178,8 @@ def push_move(queue, game_id, game, node, board, stockfish, moves_list):
     to_square = chess.square_name(move.to_square)
     promotion = None if move.promotion is None else chess.Piece(move.promotion, board.turn).symbol()
     piece = board.piece_at(chess.parse_square(from_square)).symbol()
-    
+    color = "White" if board.turn == chess.WHITE else "Black"
+
     board.push(move)
     moves_list.append(uci)
     
@@ -186,10 +187,9 @@ def push_move(queue, game_id, game, node, board, stockfish, moves_list):
     static_eval_after = stockfish.get_static_eval()
     perc_after = stockfish.get_wdl_stats(get_as_tuple=True)
     (white_win_perc_after, draw_perc_after, black_win_perc_after) = (None, None, None) if perc_after is None else perc_after
-    (eval_after, mate_count_after) = stockfish.get_evaluation()
+    (eval_after, mate_count_after) = parse_eval(stockfish.get_evaluation())
 
     move_no_pair = board.fullmove_number
-    color = "White" if board.turn == chess.WHITE else "Black"
     move_no = board.ply()
     fen_after = board.fen()
     time_remaining = node.clock() or None
@@ -219,8 +219,8 @@ def push_move(queue, game_id, game, node, board, stockfish, moves_list):
         "white_win_perc_after": white_win_perc_before/wdl_totals,
         "black_win_perc_after": black_win_perc_before/wdl_totals,
         "draw_perc_after": draw_perc_before/wdl_totals,
-        "static_eval_before": None, #static_eval_before, 
-        "static_eval_after": None, #static_eval_after, 
+        "static_eval_before": static_eval_before, 
+        "static_eval_after": static_eval_after, 
         "eval_before":eval_before, 
         "mate_count_before":mate_count_before, 
         "eval_after":eval_after, 
