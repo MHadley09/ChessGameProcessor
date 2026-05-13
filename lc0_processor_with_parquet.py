@@ -30,11 +30,17 @@ from plane_codec import board_to_planes, pack_planes
 from deduplication_helpers import GameDeduplicator
 
 try:
-    from parquet_writer import ParquetWriter
+    from parquet_writer import ParquetWriter, GameRecord, MoveRecord, PossibleMoveRecord
     PARQUET_AVAILABLE = True
 except ImportError:
     PARQUET_AVAILABLE = False
     print("Warning: parquet_writer not available. Install pyarrow: pip install pyarrow")
+
+try:
+    from batch_evaluator import SyncBatchEvaluator
+    BATCH_EVAL_AVAILABLE = True
+except ImportError:
+    BATCH_EVAL_AVAILABLE = False
 
 
 class LC0GameProcessorWithParquet:
@@ -50,24 +56,37 @@ class LC0GameProcessorWithParquet:
                  backend: str = "cuda-fp16",
                  write_parquet: bool = True,
                  write_sqlite: bool = True,
+                 headers_only_sqlite: bool = True,
+                 num_engines: int = 16,
                  verbose: bool = True):
         self.db_path = db_path
         self.output_dir = Path(output_dir)
         self.write_parquet = write_parquet and PARQUET_AVAILABLE
         self.write_sqlite = write_sqlite
+        self.headers_only_sqlite = headers_only_sqlite
         self.verbose = verbose
 
         if write_parquet and not PARQUET_AVAILABLE:
             raise ImportError("Parquet writing requested but parquet_writer not available.")
 
         print(f"Initializing LC0 processor with {backend} backend...")
-        self.evaluator = LC0Evaluator(
-            weights_path=weights_path,
-            backend=backend,
-            threads=4,
-            max_batch_size=256,
-            verbose=False
-        )
+        if BATCH_EVAL_AVAILABLE and num_engines > 1:
+            print(f"  Using batch evaluator with {num_engines} async engines")
+            self.evaluator = SyncBatchEvaluator(
+                weights_path=weights_path,
+                backend=backend,
+                num_engines=num_engines,
+            )
+            self._use_batch = True
+        else:
+            self.evaluator = LC0Evaluator(
+                weights_path=weights_path,
+                backend=backend,
+                threads=4,
+                max_batch_size=256,
+                verbose=False
+            )
+            self._use_batch = False
 
         self.deduplicator = GameDeduplicator(db_path)
 
@@ -289,16 +308,30 @@ class LC0GameProcessorWithParquet:
         # ── game record ──
         game_data = self._build_game_record(game, game_id, game_order)
 
-        # Games go to parquet only; headers stay in SQLite via chess_evaluator
+        # Games/headers always go to SQLite
+        if conn:
+            # Use a subset of fields that match the SQLite games table
+            header_cols = ['game_id', 'game_order', 'event', 'site', 'date_played', 'round',
+                          'white', 'black', 'result', 'white_elo', 'white_rating_diff',
+                          'black_elo', 'black_rating_diff', 'white_title', 'black_title',
+                          'winner', 'winner_elo', 'loser', 'loser_elo', 'winner_loser_elo_diff',
+                          'eco', 'termination', 'time_control', 'utc_date', 'utc_time',
+                          'variant', 'ply_count', 'game_hash', 'evaluated_by',
+                          'evaluator_version', 'evaluated_at']
+            header_data = {k: game_data[k] for k in header_cols if k in game_data}
+            cols = ', '.join(header_data.keys())
+            placeholders = ', '.join(f':{k}' for k in header_data.keys())
+            conn.execute(f"INSERT OR REPLACE INTO games ({cols}) VALUES ({placeholders})", header_data)
+
+        # Games also go to parquet with full data
         if self.write_parquet:
-            self.parquet_writers['games'].write(game_data)
+            self.parquet_writers['games'].add_game(GameRecord(**game_data))
 
         # ── iterate moves ──
         board = game.board()
         positions = 0
         possible_moves_count = 0
         moves_list = []
-        prev_boards = []
 
         node = game
         while node.variations:
@@ -314,21 +347,45 @@ class LC0GameProcessorWithParquet:
 
             # ── possible moves at this position ──
             legal_moves = list(board.legal_moves)
-            for legal_move in legal_moves:
-                board_copy = board.copy()
-                board_copy.push(legal_move)
-                pm_eval = self.evaluator.evaluate_position(board_copy)
-                pm_record = self._build_possible_move(game_id, board, legal_move, fen_before, pm_eval)
 
-                if conn:
-                    pm_cols = ', '.join(pm_record.keys())
-                    pm_ph = ', '.join(f':{k}' for k in pm_record.keys())
-                    conn.execute(f"INSERT INTO possible_move_evals ({pm_cols}) VALUES ({pm_ph})", pm_record)
+            if self._use_batch and len(legal_moves) > 0:
+                # Batch evaluate all legal moves at once
+                pm_boards = []
+                for lm in legal_moves:
+                    bc = board.copy()
+                    bc.push(lm)
+                    pm_boards.append(bc)
+                pm_evals = self.evaluator.evaluate_batch(pm_boards)
 
-                if self.write_parquet:
-                    self.parquet_writers['possible_moves'].write(pm_record)
+                for legal_move, pm_eval in zip(legal_moves, pm_evals):
+                    pm_record = self._build_possible_move(game_id, board, legal_move, fen_before, pm_eval)
 
-                possible_moves_count += 1
+                    if conn and not self.headers_only_sqlite:
+                        pm_cols = ', '.join(pm_record.keys())
+                        pm_ph = ', '.join(f':{k}' for k in pm_record.keys())
+                        conn.execute(f"INSERT INTO possible_move_evals ({pm_cols}) VALUES ({pm_ph})", pm_record)
+
+                    if self.write_parquet:
+                        self.parquet_writers['possible_moves'].add_possible_move(PossibleMoveRecord(**pm_record))
+
+                    possible_moves_count += 1
+            else:
+                # Single eval fallback
+                for legal_move in legal_moves:
+                    board_copy = board.copy()
+                    board_copy.push(legal_move)
+                    pm_eval = self.evaluator.evaluate_position(board_copy)
+                    pm_record = self._build_possible_move(game_id, board, legal_move, fen_before, pm_eval)
+
+                    if conn and not self.headers_only_sqlite:
+                        pm_cols = ', '.join(pm_record.keys())
+                        pm_ph = ', '.join(f':{k}' for k in pm_record.keys())
+                        conn.execute(f"INSERT INTO possible_move_evals ({pm_cols}) VALUES ({pm_ph})", pm_record)
+
+                    if self.write_parquet:
+                        self.parquet_writers['possible_moves'].add_possible_move(PossibleMoveRecord(**pm_record))
+
+                    possible_moves_count += 1
 
             # ── derive move metadata BEFORE push ──
             player = headers.get("White", "Unknown") if board.turn == chess.WHITE else headers.get("Black", "Unknown")
@@ -340,10 +397,6 @@ class LC0GameProcessorWithParquet:
             piece_obj = board.piece_at(chess.parse_square(from_square))
             piece = piece_obj.symbol() if piece_obj else "?"
             color = "White" if board.turn == chess.WHITE else "Black"
-
-            # ── planes before ──
-            planes = board_to_planes(board, prev_boards)
-            planes_blob = pack_planes(planes)
 
             # ── execute move ──
             board.push(move)
@@ -358,9 +411,6 @@ class LC0GameProcessorWithParquet:
             (eval_after, mate_count_after) = self._parse_eval(eval_after_result)
             static_eval_after = eval_after_result.get('ev')
             wdl_after = eval_after_result.get('wdl', [333, 334, 333])
-
-            planes_after = board_to_planes(board, [board])
-            planes_after_blob = pack_planes(planes_after)
 
             time_remaining = self._get_time_remaining(node)
             time_spent = self._get_time_spent(node)
@@ -400,9 +450,23 @@ class LC0GameProcessorWithParquet:
                 'evaluator_version': self.engine_info['version'],
             }
 
-            # SQLite gets everything including planes
-            if conn:
-                sqlite_move = dict(move_data)
+            # SQLite gets everything including planes (generated here for SQLite only)
+            if conn and not self.headers_only_sqlite:
+                # Build move history as (from_sq, to_sq) tuples for plane_codec
+                move_history = []
+                temp_board = board.copy()
+                for past_uci in reversed(moves_list[:-1]):  # exclude current move
+                    past_move = chess.Move.from_uci(past_uci)
+                    move_history.append((past_move.from_square, past_move.to_square))
+                    if len(move_history) >= 2:
+                        break
+                # Planes before: undo current move
+                board_before = board.copy()
+                board_before.pop()
+                planes_blob = pack_planes(board_to_planes(board_before, move_history))
+                # Planes after: current board, history includes current move
+                history_after = [(move.from_square, move.to_square)] + move_history[:1]
+                planes_after_blob = pack_planes(board_to_planes(board, history_after))
                 sqlite_move['planes_before'] = planes_blob
                 sqlite_move['planes_after'] = planes_after_blob
                 cols = ', '.join(sqlite_move.keys())
@@ -411,10 +475,9 @@ class LC0GameProcessorWithParquet:
 
             # Parquet gets everything except planes (generate at training time from FENs)
             if self.write_parquet:
-                self.parquet_writers['moves'].write(move_data)
+                self.parquet_writers['moves'].add_move(MoveRecord(**move_data))
 
             positions += 1
-            prev_boards = [board.copy()] + prev_boards[:1]
 
         return {
             'positions': positions,
@@ -492,9 +555,14 @@ class LC0GameProcessorWithParquet:
                         if games_processed % 10 == 0 and self.verbose:
                             elapsed = (datetime.now() - start_time).total_seconds()
                             rate = positions_evaluated / elapsed if elapsed > 0 else 0
-                            print(f"  [{games_processed}] {positions_evaluated:,} positions, "
-                                  f"{possible_moves_written:,} possible moves, "
-                                  f"{rate:.1f} pos/sec")
+                            games_per_sec = games_processed / elapsed if elapsed > 0 else 0
+                            eta_sec = (250000 - games_processed) / games_per_sec if games_per_sec > 0 else 0
+                            eta_h = eta_sec / 3600
+                            print(f"  [{games_processed:,} games | {games_skipped:,} skipped] "
+                                  f"{positions_evaluated:,} pos, "
+                                  f"{possible_moves_written:,} pm | "
+                                  f"{rate:.0f} pos/s, {games_per_sec:.2f} games/s | "
+                                  f"ETA: {eta_h:.1f}h")
 
                         if conn and games_processed % 50 == 0:
                             conn.commit()
@@ -561,6 +629,8 @@ if __name__ == '__main__':
     parser.add_argument('--backend', default='cuda-fp16', help='LC0 backend')
     parser.add_argument('--no-parquet', action='store_true', help='Disable Parquet output')
     parser.add_argument('--no-sqlite', action='store_true', help='Disable SQLite output')
+    parser.add_argument('--full-sqlite', action='store_true', help='Write moves/possible_moves to SQLite too (default: headers only)')
+    parser.add_argument('--num-engines', type=int, default=16, help='Number of async LC0 engines for batch eval (default: 16)')
     parser.add_argument('--max-games', type=int, help='Max games to process')
 
     args = parser.parse_args()
@@ -572,6 +642,8 @@ if __name__ == '__main__':
         backend=args.backend,
         write_parquet=not args.no_parquet,
         write_sqlite=not args.no_sqlite,
+        headers_only_sqlite=not args.full_sqlite,
+        num_engines=args.num_engines,
         verbose=True
     )
 
