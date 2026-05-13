@@ -222,7 +222,15 @@ class SyncBatchEvaluator:
                  num_engines: int = 16,
                  nodes: int = 1,
                  **kwargs):
+        import sys
+        import threading
+
+        # Create event loop in a dedicated thread to avoid Windows
+        # asyncio + multiprocessing subprocess pipe conflicts
         self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
         self._batch_eval = BatchLC0Evaluator(
             engine_path=engine_path,
             weights_path=weights_path,
@@ -230,7 +238,14 @@ class SyncBatchEvaluator:
             num_engines=num_engines,
             nodes=nodes,
         )
-        self._loop.run_until_complete(self._batch_eval.start())
+        # Start engines on the loop thread
+        future = asyncio.run_coroutine_threadsafe(self._batch_eval.start(), self._loop)
+        future.result(timeout=120)  # Wait up to 2min for engines to start
+
+    def _run_loop(self):
+        """Run the event loop forever in a background thread."""
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
 
     @property
     def network_info(self):
@@ -238,22 +253,29 @@ class SyncBatchEvaluator:
 
     def evaluate_position(self, board: chess.Board) -> Dict:
         """Single position eval — same API as old evaluator."""
-        return self._loop.run_until_complete(
-            self._batch_eval.evaluate_position(board)
+        future = asyncio.run_coroutine_threadsafe(
+            self._batch_eval.evaluate_position(board), self._loop
         )
+        return future.result(timeout=30)
 
     def evaluate_batch(self, boards: List[chess.Board]) -> List[Dict]:
         """Batch eval — fire all positions concurrently."""
-        return self._loop.run_until_complete(
-            self._batch_eval.evaluate_batch(boards)
+        future = asyncio.run_coroutine_threadsafe(
+            self._batch_eval.evaluate_batch(boards), self._loop
         )
+        return future.result(timeout=120)
 
     def get_stats(self):
         return self._batch_eval.get_stats()
 
     def close(self):
-        self._loop.run_until_complete(self._batch_eval.stop())
-        self._loop.close()
+        try:
+            future = asyncio.run_coroutine_threadsafe(self._batch_eval.stop(), self._loop)
+            future.result(timeout=30)
+        except Exception:
+            pass
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=5)
 
 
 if __name__ == '__main__':

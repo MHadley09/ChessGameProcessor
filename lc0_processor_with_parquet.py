@@ -53,6 +53,7 @@ class LC0GameProcessorWithParquet:
                  db_path: str,
                  weights_path: str,
                  output_dir: str = "output",
+                 engine_path: str = None,
                  backend: str = "cuda-fp16",
                  write_parquet: bool = True,
                  write_sqlite: bool = True,
@@ -65,6 +66,7 @@ class LC0GameProcessorWithParquet:
         self.write_sqlite = write_sqlite
         self.headers_only_sqlite = headers_only_sqlite
         self.verbose = verbose
+        self.engine_path = engine_path
 
         if write_parquet and not PARQUET_AVAILABLE:
             raise ImportError("Parquet writing requested but parquet_writer not available.")
@@ -72,23 +74,22 @@ class LC0GameProcessorWithParquet:
         print(f"Initializing LC0 processor with {backend} backend...")
         if BATCH_EVAL_AVAILABLE and num_engines > 1:
             print(f"  Using batch evaluator with {num_engines} async engines")
-            self.evaluator = SyncBatchEvaluator(
-                weights_path=weights_path,
-                backend=backend,
-                num_engines=num_engines,
-            )
+            eval_kwargs = {'weights_path': weights_path, 'backend': backend, 'num_engines': num_engines}
+            if engine_path:
+                eval_kwargs['engine_path'] = engine_path
+            self.evaluator = SyncBatchEvaluator(**eval_kwargs)
             self._use_batch = True
         else:
-            self.evaluator = LC0Evaluator(
-                weights_path=weights_path,
-                backend=backend,
-                threads=4,
-                max_batch_size=256,
-                verbose=False
-            )
+            eval_kwargs = {'weights_path': weights_path, 'backend': backend, 'threads': 4}
+            if engine_path:
+                eval_kwargs['engine_path'] = engine_path
+            self.evaluator = LC0Evaluator(**eval_kwargs)
             self._use_batch = False
 
-        self.deduplicator = GameDeduplicator(db_path)
+        if db_path:
+            self.deduplicator = GameDeduplicator(db_path)
+        else:
+            self.deduplicator = None
 
         self.engine_info = {
             'engine': 'lc0',
@@ -497,10 +498,11 @@ class LC0GameProcessorWithParquet:
 
         conn = None
         if self.write_sqlite:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=30)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA cache_size=-64000")
+            conn.execute("PRAGMA busy_timeout=30000")
 
         games_processed = 0
         games_skipped = 0
@@ -626,6 +628,7 @@ if __name__ == '__main__':
     parser.add_argument('--db', default='chess.db', help='SQLite database')
     parser.add_argument('--output-dir', default='output', help='Parquet output directory')
     parser.add_argument('--weights', required=True, help='LC0 weights file')
+    parser.add_argument('--engine-path', default=None, help='Path to lc0.exe')
     parser.add_argument('--backend', default='cuda-fp16', help='LC0 backend')
     parser.add_argument('--no-parquet', action='store_true', help='Disable Parquet output')
     parser.add_argument('--no-sqlite', action='store_true', help='Disable SQLite output')
@@ -639,6 +642,7 @@ if __name__ == '__main__':
         db_path=args.db,
         weights_path=args.weights,
         output_dir=args.output_dir,
+        engine_path=args.engine_path,
         backend=args.backend,
         write_parquet=not args.no_parquet,
         write_sqlite=not args.no_sqlite,
