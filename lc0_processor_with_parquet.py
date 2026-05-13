@@ -328,113 +328,158 @@ class LC0GameProcessorWithParquet:
         if self.write_parquet:
             self.parquet_writers['games'].add_game(GameRecord(**game_data))
 
-        # ── iterate moves ──
+        # ── iterate moves — two-phase: collect all positions, then batch eval ──
         board = game.board()
         positions = 0
         possible_moves_count = 0
         moves_list = []
 
+        # Phase 1: Walk the game tree, collect all boards to evaluate
+        move_metadata = []  # per-move metadata collected during walk
+        all_boards = []     # flat list of boards to batch-eval
+        board_map = []      # (move_idx, role, pm_idx) to map results back
+
+        # eval_before for move 0 = starting position
+        # eval_after for move N = eval_before for move N+1
+        # So we need: position_before[0], possible_moves[0], position_before[1], possible_moves[1], ..., position_after[last]
+        # Which simplifies to: position[0], pm[0], position[1], pm[1], ..., position[N], pm[N], position[N+1]
+        # And position[N] serves as both eval_after[N-1] and eval_before[N]
+
+        # Collect all board positions at each ply
+        ply_boards = [board.copy()]  # position before move 0
+
         node = game
+        move_nodes = []
         while node.variations:
             node = node.variation(0)
             move = node.move
 
-            # ── position BEFORE the move ──
-            fen_before = board.fen()
-            eval_before_result = self.evaluator.evaluate_position(board)
-            (eval_before, mate_count_before) = self._parse_eval(eval_before_result)
-            static_eval_before = eval_before_result.get('ev')  # LC0 has no separate static eval; use NN eval
-            wdl_before = eval_before_result.get('wdl', [333, 334, 333])
-
-            # ── possible moves at this position ──
             legal_moves = list(board.legal_moves)
 
-            if self._use_batch and len(legal_moves) > 0:
-                # Batch evaluate all legal moves at once
-                pm_boards = []
-                for lm in legal_moves:
-                    bc = board.copy()
-                    bc.push(lm)
-                    pm_boards.append(bc)
-                pm_evals = self.evaluator.evaluate_batch(pm_boards)
-
-                for legal_move, pm_eval in zip(legal_moves, pm_evals):
-                    pm_record = self._build_possible_move(game_id, board, legal_move, fen_before, pm_eval)
-
-                    if conn and not self.headers_only_sqlite:
-                        pm_cols = ', '.join(pm_record.keys())
-                        pm_ph = ', '.join(f':{k}' for k in pm_record.keys())
-                        conn.execute(f"INSERT INTO possible_move_evals ({pm_cols}) VALUES ({pm_ph})", pm_record)
-
-                    if self.write_parquet:
-                        self.parquet_writers['possible_moves'].add_possible_move(PossibleMoveRecord(**pm_record))
-
-                    possible_moves_count += 1
-            else:
-                # Single eval fallback
-                for legal_move in legal_moves:
-                    board_copy = board.copy()
-                    board_copy.push(legal_move)
-                    pm_eval = self.evaluator.evaluate_position(board_copy)
-                    pm_record = self._build_possible_move(game_id, board, legal_move, fen_before, pm_eval)
-
-                    if conn and not self.headers_only_sqlite:
-                        pm_cols = ', '.join(pm_record.keys())
-                        pm_ph = ', '.join(f':{k}' for k in pm_record.keys())
-                        conn.execute(f"INSERT INTO possible_move_evals ({pm_cols}) VALUES ({pm_ph})", pm_record)
-
-                    if self.write_parquet:
-                        self.parquet_writers['possible_moves'].add_possible_move(PossibleMoveRecord(**pm_record))
-
-                    possible_moves_count += 1
-
-            # ── derive move metadata BEFORE push ──
+            # Metadata we can derive without evals
             player = headers.get("White", "Unknown") if board.turn == chess.WHITE else headers.get("Black", "Unknown")
-            uci = move.uci()
-            san = board.san(move)
-            from_square = chess.square_name(move.from_square)
-            to_square = chess.square_name(move.to_square)
-            promotion = None if move.promotion is None else chess.Piece(move.promotion, board.turn).symbol()
-            piece_obj = board.piece_at(chess.parse_square(from_square))
-            piece = piece_obj.symbol() if piece_obj else "?"
-            color = "White" if board.turn == chess.WHITE else "Black"
+            uci_str = move.uci()
+            san_str = board.san(move)
+            from_sq = chess.square_name(move.from_square)
+            to_sq = chess.square_name(move.to_square)
+            promo = None if move.promotion is None else chess.Piece(move.promotion, board.turn).symbol()
+            piece_obj = board.piece_at(chess.parse_square(from_sq))
+            piece_str = piece_obj.symbol() if piece_obj else "?"
+            color_str = "White" if board.turn == chess.WHITE else "Black"
+            fen_before = board.fen()
 
-            # ── execute move ──
+            # Collect possible-move boards (from position before push)
+            pm_boards = []
+            for lm in legal_moves:
+                bc = board.copy()
+                bc.push(lm)
+                pm_boards.append(bc)
+
             board.push(move)
-            moves_list.append(uci)
+            moves_list_copy = moves_list + [uci_str]
+            moves_list.append(uci_str)
 
-            move_no_pair = board.fullmove_number
-            move_no = board.ply()
-            fen_after = board.fen()
+            move_metadata.append({
+                'move': move,
+                'node': node,
+                'player': player,
+                'uci': uci_str,
+                'san': san_str,
+                'from_square': from_sq,
+                'to_square': to_sq,
+                'promotion': promo,
+                'piece': piece_str,
+                'color': color_str,
+                'fen_before': fen_before,
+                'fen_after': board.fen(),
+                'move_no': board.ply(),
+                'move_no_pair': board.fullmove_number,
+                'legal_moves': legal_moves,
+                'pm_boards': pm_boards,
+                'game_to_position': ' '.join(moves_list_copy),
+            })
 
-            # ── position AFTER the move ──
-            eval_after_result = self.evaluator.evaluate_position(board)
+            ply_boards.append(board.copy())  # position after this move
+
+        # Phase 2: Build flat batch — ply positions + all possible-move positions
+        # ply_boards has N+1 entries for N moves
+        # eval_before[i] = ply_boards[i], eval_after[i] = ply_boards[i+1]
+
+        if self._use_batch and len(move_metadata) > 0:
+            batch_boards = list(ply_boards)  # ply positions first
+            pm_offsets = []  # (start_idx, count) in batch_boards for each move's PMs
+
+            for md in move_metadata:
+                start = len(batch_boards)
+                batch_boards.extend(md['pm_boards'])
+                pm_offsets.append((start, len(md['pm_boards'])))
+
+            all_evals = self.evaluator.evaluate_batch(batch_boards)
+
+            ply_evals = all_evals[:len(ply_boards)]
+        else:
+            # Sequential fallback
+            ply_evals = [self.evaluator.evaluate_position(b) for b in ply_boards]
+            all_evals = None
+            pm_offsets = None
+
+        # Phase 3: Write results
+        for i, md in enumerate(move_metadata):
+            eval_before_result = ply_evals[i]
+            eval_after_result = ply_evals[i + 1]
+
+            (eval_before, mate_count_before) = self._parse_eval(eval_before_result)
+            static_eval_before = eval_before_result.get('ev')
+            wdl_before = eval_before_result.get('wdl', [333, 334, 333])
+
             (eval_after, mate_count_after) = self._parse_eval(eval_after_result)
             static_eval_after = eval_after_result.get('ev')
             wdl_after = eval_after_result.get('wdl', [333, 334, 333])
 
-            time_remaining = self._get_time_remaining(node)
-            time_spent = self._get_time_spent(node)
+            # Possible moves
+            if self._use_batch:
+                pm_start, pm_count = pm_offsets[i]
+                pm_evals = all_evals[pm_start:pm_start + pm_count]
+            else:
+                pm_evals = [self.evaluator.evaluate_position(b) for b in md['pm_boards']]
+
+            # Reconstruct board_before for _build_possible_move
+            board_before = ply_boards[i]
+            for legal_move, pm_eval in zip(md['legal_moves'], pm_evals):
+                pm_record = self._build_possible_move(game_id, board_before, legal_move, md['fen_before'], pm_eval)
+
+                if conn and not self.headers_only_sqlite:
+                    pm_cols = ', '.join(pm_record.keys())
+                    pm_ph = ', '.join(f':{k}' for k in pm_record.keys())
+                    conn.execute(f"INSERT INTO possible_move_evals ({pm_cols}) VALUES ({pm_ph})", pm_record)
+
+                if self.write_parquet:
+                    self.parquet_writers['possible_moves'].add_possible_move(PossibleMoveRecord(**pm_record))
+
+                possible_moves_count += 1
+
+            time_remaining = self._get_time_remaining(md['node'])
+            time_spent = self._get_time_spent(md['node'])
 
             wdl_total = 1000.0
 
             move_data = {
                 'game_id': game_id,
-                'move_no': move_no,
-                'move_no_pair': move_no_pair,
-                'player': self._hash_player(player),
-                'notation': san,
-                'move': uci,
-                'from_square': from_square,
-                'to_square': to_square,
-                'piece': piece,
-                'promotion': promotion,
-                'color': color,
-                'fen_before': fen_before,
-                'fen_after': fen_after,
+                'move_no': md['move_no'],
+                'move_no_pair': md['move_no_pair'],
+                'player': self._hash_player(md['player']),
+                'notation': md['san'],
+                'move': md['uci'],
+                'from_square': md['from_square'],
+                'to_square': md['to_square'],
+                'piece': md['piece'],
+                'promotion': md['promotion'],
+                'color': md['color'],
+                'fen_before': md['fen_before'],
+                'fen_after': md['fen_after'],
                 'time_remaining': time_remaining,
                 'time_spent': time_spent,
-                'game_to_position': ' '.join(moves_list),
+                'game_to_position': md['game_to_position'],
                 'white_win_perc_before': wdl_before[0] / wdl_total,
                 'black_win_perc_before': wdl_before[2] / wdl_total,
                 'draw_perc_before': wdl_before[1] / wdl_total,
@@ -453,28 +498,23 @@ class LC0GameProcessorWithParquet:
 
             # SQLite gets everything including planes (generated here for SQLite only)
             if conn and not self.headers_only_sqlite:
-                # Build move history as (from_sq, to_sq) tuples for plane_codec
                 move_history = []
-                temp_board = board.copy()
-                for past_uci in reversed(moves_list[:-1]):  # exclude current move
+                game_moves_so_far = md['game_to_position'].split()
+                for past_uci in reversed(game_moves_so_far[:-1]):
                     past_move = chess.Move.from_uci(past_uci)
                     move_history.append((past_move.from_square, past_move.to_square))
                     if len(move_history) >= 2:
                         break
-                # Planes before: undo current move
-                board_before = board.copy()
-                board_before.pop()
-                planes_blob = pack_planes(board_to_planes(board_before, move_history))
-                # Planes after: current board, history includes current move
-                history_after = [(move.from_square, move.to_square)] + move_history[:1]
-                planes_after_blob = pack_planes(board_to_planes(board, history_after))
+                planes_blob = pack_planes(board_to_planes(ply_boards[i], move_history))
+                history_after = [(md['move'].from_square, md['move'].to_square)] + move_history[:1]
+                planes_after_blob = pack_planes(board_to_planes(ply_boards[i+1], history_after))
+                sqlite_move = dict(move_data)
                 sqlite_move['planes_before'] = planes_blob
                 sqlite_move['planes_after'] = planes_after_blob
                 cols = ', '.join(sqlite_move.keys())
                 ph = ', '.join(f':{k}' for k in sqlite_move.keys())
                 conn.execute(f"INSERT INTO actual_moves ({cols}) VALUES ({ph})", sqlite_move)
 
-            # Parquet gets everything except planes (generate at training time from FENs)
             if self.write_parquet:
                 self.parquet_writers['moves'].add_move(MoveRecord(**move_data))
 

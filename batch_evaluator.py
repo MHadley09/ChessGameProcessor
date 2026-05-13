@@ -115,17 +115,17 @@ class BatchLC0Evaluator:
         """Evaluate a single position on a specific engine."""
         engine = self.engines[engine_idx]
         
-        # Handle terminal positions
-        if board.is_checkmate():
-            cp = -10000 if board.turn == chess.WHITE else 10000
-            wdl = [0, 0, 1000] if board.turn == chess.WHITE else [1000, 0, 0]
-            return {'ev': cp, 'wdl': wdl, 'best_move': None,
-                    'engine': 'lc0', 'network': self._network_hash}
-
-        if (board.is_stalemate() or board.is_insufficient_material() or
-                board.can_claim_draw() or board.is_fifty_moves() or board.is_repetition()):
-            return {'ev': 0, 'wdl': [0, 1000, 0], 'best_move': None,
-                    'engine': 'lc0', 'network': self._network_hash}
+        # Handle terminal positions before calling engine
+        if board.is_game_over():
+            if board.is_checkmate():
+                cp = -10000 if board.turn == chess.WHITE else 10000
+                wdl = [0, 0, 1000] if board.turn == chess.WHITE else [1000, 0, 0]
+                return {'ev': cp, 'wdl': wdl, 'best_move': None,
+                        'engine': 'lc0', 'network': self._network_hash}
+            else:
+                # Stalemate, draw, etc.
+                return {'ev': 0, 'wdl': [0, 1000, 0], 'best_move': None,
+                        'engine': 'lc0', 'network': self._network_hash}
 
         try:
             info = await engine.analyse(
@@ -133,7 +133,8 @@ class BatchLC0Evaluator:
                 chess.engine.Limit(nodes=self.nodes),
                 info=chess.engine.INFO_ALL
             )
-        except chess.engine.EngineError:
+        except Exception:
+            # EngineError, a1a1 invalid move, or any engine glitch
             return {'ev': 0, 'wdl': [333, 334, 333], 'best_move': None,
                     'engine': 'lc0', 'network': self._network_hash}
 

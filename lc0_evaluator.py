@@ -84,6 +84,19 @@ class LC0Evaluator:
         """
         start = time.time()
         
+        # Handle terminal positions before calling engine
+        if board.is_game_over():
+            self.stats['positions_evaluated'] += 1
+            self.stats['total_time'] += time.time() - start
+            if board.is_checkmate():
+                cp = -10000 if board.turn == chess.WHITE else 10000
+                wdl = [0, 0, 1000] if board.turn == chess.WHITE else [1000, 0, 0]
+                return {'ev': cp, 'wdl': wdl, 'best_move': None,
+                        'engine': 'lc0', 'network': self._network_hash}
+            else:
+                return {'ev': 0, 'wdl': [0, 1000, 0], 'best_move': None,
+                        'engine': 'lc0', 'network': self._network_hash}
+        
         # Analyse with 1 node minimum to avoid LC0 returning invalid 'a1a1' moves
         try:
             info = self.engine.analyse(
