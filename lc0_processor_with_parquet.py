@@ -58,7 +58,8 @@ class LC0GameProcessorWithParquet:
                  output_dir: str = "output",
                  backend: str = "cuda-fp16",
                  write_parquet: bool = True,
-                 write_sqlite: bool = True,
+                 write_sqlite: bool = False,
+                 write_sqlite_headers_only = True,
                  verbose: bool = True):
         """
         Initialize processor with dual output support.
@@ -76,6 +77,8 @@ class LC0GameProcessorWithParquet:
         self.output_dir = Path(output_dir)
         self.write_parquet = write_parquet and PARQUET_AVAILABLE
         self.write_sqlite = write_sqlite
+        self.write_sqlite_headers_only = write_sqlite_headers_only
+
         self.verbose = verbose
         
         if write_parquet and not PARQUET_AVAILABLE:
@@ -155,7 +158,7 @@ class LC0GameProcessorWithParquet:
         
         # Open SQLite connection if needed
         conn = None
-        if self.write_sqlite:
+        if self.write_sqlite or self.write_sqlite_headers_only:
             conn = sqlite3.connect(self.db_path)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
@@ -373,7 +376,7 @@ class LC0GameProcessorWithParquet:
                 }
                 
                 # Write to SQLite
-                if conn:
+                if conn and not self.write_sqlite_headers_only:
                     conn.execute("""
                         INSERT INTO possible_move_evals (
                             game_id, move_no, move_uci, centipawn, mate_score,
@@ -428,7 +431,7 @@ class LC0GameProcessorWithParquet:
             }
             
             # Write to SQLite
-            if conn:
+            if conn and not self.write_sqlite_headers_only:
                 conn.execute("""
                     INSERT INTO actual_moves (
                         game_id, move_no, move_uci, fen_before, fen_after,
