@@ -1,0 +1,8 @@
+Warning: parquet_writer not available. Install pyarrow: pip install pyarrow
+Traceback (most recent call last):
+  File "C:\Users\micha\Personal\School\DEng\dissertation\mutation\ChessGameProcessor\lc0_processor_with_parquet.py", line 521, in <module>
+    processor = LC0GameProcessorWithParquet(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\micha\Personal\School\DEng\dissertation\mutation\ChessGameProcessor\lc0_processor_with_parquet.py", line 82, in __init__
+    raise ImportError("Parquet writing requested but parquet_writer not available. "
+ImportError: Parquet writing requested but parquet_writer not available. Install with: pip install pyarrow
