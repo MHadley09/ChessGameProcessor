@@ -3,7 +3,7 @@
 parquet_writer.py
 
 Compatible with lc0_processor_with_parquet.py
-Accepts schema_type parameter for different table types.
+Accepts schema_type and max_rows_per_file parameters.
 """
 
 import sys
@@ -63,20 +63,28 @@ class PossibleMoveRecord:
 class ParquetWriter:
     """Writes chess evaluation data to Parquet files"""
     
-    def __init__(self, output_dir: str, schema_type: str = 'games', batch_size: int = 10000):
+    def __init__(self, 
+                 output_dir: str, 
+                 schema_type: str = 'games', 
+                 batch_size: int = 10000,
+                 max_rows_per_file: int = 100000,
+                 **kwargs):  # Accept any other params for compatibility
         """
         Args:
             output_dir: Directory to write Parquet files
             schema_type: Type of schema ('games', 'moves', or 'possible_moves')
             batch_size: Number of records to buffer before writing
+            max_rows_per_file: Maximum rows per Parquet file before rotating
         """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.schema_type = schema_type
         self.batch_size = batch_size
+        self.max_rows_per_file = max_rows_per_file
         
         self.batch = []
         self.file_counter = 0
+        self.rows_in_current_file = 0
         
         # Define schemas for each type
         if schema_type == 'games':
@@ -135,8 +143,13 @@ class ParquetWriter:
         pq.write_table(table, output_file, compression='ZSTD')
         
         print(f"Wrote {len(self.batch)} {self.schema_type} to {output_file.name}")
+        self.rows_in_current_file += len(self.batch)
         self.batch = []
-        self.file_counter += 1
+        
+        # Rotate file if we've hit max_rows_per_file
+        if self.rows_in_current_file >= self.max_rows_per_file:
+            self.file_counter += 1
+            self.rows_in_current_file = 0
     
     def flush_all(self):
         """Flush all remaining records"""

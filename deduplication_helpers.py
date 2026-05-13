@@ -62,14 +62,24 @@ class GameDeduplicator:
         This is deterministic - same game always gets same hash.
         """
         # Extract headers
-        headers = game.headers
-        white = headers.get('White', 'Unknown')
-        black = headers.get('Black', 'Unknown')
-        date = headers.get('Date', '')
-        event = headers.get('Event', '')
-        site = headers.get('Site', '')
-        round_num = headers.get('Round', '')
+        event = game.headers.get("Event", "Unknown")
+        site = game.headers.get("Site", "Unknown")
+        white = hashlib.sha256(game.headers.get("White", "Unknown").encode('utf-8')).hexdigest()
+        black = hashlib.sha256(game.headers.get("Black", "Unknown").encode('utf-8')).hexdigest()
+        result = game.headers.get("Result", "Unknown")
+        white_elo =  1600 if not game.headers.get("WhiteElo", "1600").isdigit() else int(game.headers.get("WhiteElo", "1600"))
+        black_elo =1600 if not game.headers.get("BlackElo", "1600").isdigit() else int(game.headers.get("BlackElo", "1600"))
+        ply_count = len(list(game.mainline_moves()))
+        round = "NotUsed"
+        winner = "Unknown"
         
+        if result == "1-0":
+            winner = white
+        elif result == "0-1":
+            winner = black
+        elif result == "0.5-0.5":
+            winner = None
+
         # Get moves as string
         moves = []
         node = game
@@ -81,7 +91,8 @@ class GameDeduplicator:
         
         # Create hash input - include enough to be unique but stable
         # Don't include headers that might vary (like annotations)
-        hash_input = f"{white}|{black}|{date}|{event}|{site}|{round_num}|{moves_str}"
+        hash_input = f"{white}|{black}|{result}|{white_elo}|{black_elo}|{site}|{event}|{ply_count}|{winner}|{round}"
+
         
         # Return first 16 characters of SHA256
         # 16 hex chars = 64 bits = ~1.8e19 possibilities
