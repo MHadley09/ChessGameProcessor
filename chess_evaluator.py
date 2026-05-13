@@ -55,14 +55,14 @@ def push_headers(queue, game, count):
         winner_elo = white_elo
         winner_elo_diff = white_elo_diff
         loser_elo = black_elo
-        loser_elo_deff = black_elo_diff
+        loser_elo_diff = black_elo_diff
     elif result == "0-1":
         winner = black
         loser = white
         winner_elo = black_elo
         winner_elo_diff = black_elo_diff
         loser_elo = white_elo
-        loser_elo_deff = white_elo_diff 
+        loser_elo_diff = white_elo_diff 
     elif result == "0.5-0.5":
         winner = None
         loser = None
@@ -216,9 +216,9 @@ def push_move(queue, game_id, game, node, board, stockfish, moves_list):
         "white_win_perc_before": white_win_perc_before/wdl_totals,
         "black_win_perc_before": black_win_perc_before/wdl_totals,
         "draw_perc_before": draw_perc_before/wdl_totals,
-        "white_win_perc_after": white_win_perc_before/wdl_totals,
-        "black_win_perc_after": black_win_perc_before/wdl_totals,
-        "draw_perc_after": draw_perc_before/wdl_totals,
+        "white_win_perc_after": white_win_perc_after/wdl_totals,
+        "black_win_perc_after": black_win_perc_after/wdl_totals,
+        "draw_perc_after": draw_perc_after/wdl_totals,
         "static_eval_before": static_eval_before, 
         "static_eval_after": static_eval_after, 
         "eval_before":eval_before, 
