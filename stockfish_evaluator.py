@@ -1,10 +1,14 @@
 """
-StockfishEvaluator — depth-14 Stockfish evaluator for chess positions.
+stockfish_evaluator.py — Stockfish evaluator with WDL capture
 
-Wraps chess.engine.SimpleEngine for Stockfish UCI, evaluates at depth 14,
-and writes results to parquet using the same schema as LC0.
+Enhanced with:
+- WDL percentage capture from engine (UCI_ShowWDL)
+- Error handling and validation
+- Consistent interface with LC0 evaluator
 """
 
+import os
+import sys
 import chess
 import chess.engine
 from typing import Optional, List
@@ -22,6 +26,10 @@ class StockfishEvalResult:
     multipv: Optional[List[dict]] = None
     depth: int = 0
     nodes: int = 0
+    # WDL percentages (0.0-1.0 from WHITE's perspective)
+    wdl_w: Optional[float] = None
+    wdl_d: Optional[float] = None
+    wdl_l: Optional[float] = None
 
 
 class StockfishEvaluator:
@@ -51,25 +59,61 @@ class StockfishEvaluator:
 
     def start(self):
         """Start the Stockfish engine process."""
-        self._engine = chess.engine.SimpleEngine.popen_uci(
-            self.stockfish_path,
-            timeout=30,
-        )
-        self._engine.configure({
+        if not os.path.exists(self.stockfish_path):
+            raise RuntimeError(
+                f"Stockfish executable not found: {self.stockfish_path}\n"
+                f"Please check the path and ensure Stockfish is installed."
+            )
+
+        print(f"[SF] Starting engine: {self.stockfish_path}", file=sys.stderr)
+        print(f"[SF] Depth: {self.depth}, Threads: {self.threads}, Hash: {self.hash_mb}MB", file=sys.stderr)
+
+        try:
+            self._engine = chess.engine.SimpleEngine.popen_uci(
+                self.stockfish_path,
+                timeout=30,
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to start Stockfish: {e}")
+
+        # Configure engine
+        config = {
             "Threads": self.threads,
             "Hash": self.hash_mb,
-        })
-        # Try to get version from engine id
+            "UCI_ShowWDL": True,
+        }
+
+        print(f"[SF] Configuring engine: {config}", file=sys.stderr)
+
+        try:
+            self._engine.configure(config)
+        except Exception as e:
+            self._engine.quit()
+            raise RuntimeError(f"Failed to configure Stockfish: {e}")
+
+        # Get version
         try:
             ident = self._engine.id.get("name", "Stockfish unknown")
             self.version = ident
+            print(f"[SF] Engine version: {self.version}", file=sys.stderr)
         except Exception:
             self.version = "Stockfish"
+
+        # Smoke test
+        try:
+            board = chess.Board()
+            info = self._engine.analyse(board, chess.engine.Limit(depth=1))
+            if info.get("score") is None:
+                raise RuntimeError("Smoke test failed: no score returned")
+            print(f"[SF] Smoke test passed", file=sys.stderr)
+        except Exception as e:
+            self._engine.quit()
+            raise RuntimeError(f"Stockfish smoke test failed: {e}")
 
     def evaluate_position(
         self, board: chess.Board, multipv: int = 1
     ) -> StockfishEvalResult:
-        """Evaluate a position at the configured depth."""
+        """Evaluate a position at the configured depth with WDL."""
         if self._engine is None:
             raise RuntimeError("Engine not started — call start() first")
 
@@ -77,6 +121,7 @@ class StockfishEvaluator:
             board,
             chess.engine.Limit(depth=self.depth),
             multipv=multipv,
+            info=chess.engine.INFO_ALL,
         )
 
         result = StockfishEvalResult()
@@ -104,6 +149,14 @@ class StockfishEvaluator:
         result.depth = top.get("depth", self.depth)
         result.nodes = top.get("nodes", 0)
 
+        # WDL from top line
+        wdl = top.get("wdl")
+        if wdl:
+            wdl_white = wdl.white()
+            result.wdl_w = wdl_white.wins / 1000.0
+            result.wdl_d = wdl_white.draws / 1000.0
+            result.wdl_l = wdl_white.losses / 1000.0
+
         # Collect all PV lines
         result.multipv = []
         for entry in entries:
@@ -117,6 +170,7 @@ class StockfishEvaluator:
                 else:
                     mv["score_cp"] = p.score()
                     mv["score_mate"] = None
+
             pv = entry.get("pv", [])
             if pv:
                 mv["move_uci"] = pv[0].uci()
@@ -124,8 +178,18 @@ class StockfishEvaluator:
                     mv["move_san"] = board.san(pv[0])
                 except Exception:
                     mv["move_san"] = mv["move_uci"]
+
             mv["nodes"] = entry.get("nodes", 0)
             mv["depth"] = entry.get("depth", 0)
+
+            # Per-PV WDL
+            wdl = entry.get("wdl")
+            if wdl:
+                wdl_white = wdl.white()
+                mv["wdl_w"] = wdl_white.wins / 1000.0
+                mv["wdl_d"] = wdl_white.draws / 1000.0
+                mv["wdl_l"] = wdl_white.losses / 1000.0
+
             result.multipv.append(mv)
 
         return result
@@ -158,5 +222,10 @@ if __name__ == "__main__":
         print(f"Engine: {sf.version}")
         result = sf.evaluate_position(board, multipv=3)
         print(f"Best move: {result.best_move_san}  Score: {result.score_cp}cp")
+        if result.wdl_w is not None:
+            print(f"WDL: {result.wdl_w*100:.1f}% / {result.wdl_d*100:.1f}% / {result.wdl_l*100:.1f}%")
         for i, pv in enumerate(result.multipv or []):
-            print(f"  PV {i+1}: {pv.get('move_san')} = {pv.get('score_cp')}cp")
+            wdl_str = ""
+            if pv.get("wdl_w") is not None:
+                wdl_str = f" WDL={pv['wdl_w']*100:.1f}/{pv.get('wdl_d',0)*100:.1f}/{pv['wdl_l']*100:.1f}"
+            print(f"  PV {i+1}: {pv.get('move_san')} = {pv.get('score_cp')}cp{wdl_str}")

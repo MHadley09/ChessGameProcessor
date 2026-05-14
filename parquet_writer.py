@@ -1,147 +1,141 @@
 """
-ParquetWriter — Fixed version that doesn't overwrite data on each flush.
+ParquetWriter — Writes game evaluation data to parquet files.
 
-BUG FIX: The original _flush() called pq.write_table(table, output_file) which
-OVERWRITES the file every time. With batch_size=10000 and max_rows_per_file=100000,
-the first 9 flushes to _000000.parquet each destroyed the previous data. Only the
-last 10K rows survived per file rotation.
-
-FIX: Each flush increments file_counter so every batch lands in its own file.
-This is simple, safe, and lets downstream readers use pyarrow.parquet.ParquetDataset
-to read all part files transparently.
+Imports schemas from parquet_schema.py (the canonical source of truth).
+Dataclass fields match the schemas exactly (same names, same order).
+Each flush produces a NEW file — no overwrites.
 """
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from typing import List, Optional
 from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from parquet_schema import GAMES_SCHEMA, MOVES_SCHEMA, POSSIBLE_MOVES_SCHEMA
 
-# ── Schemas ──────────────────────────────────────────────────────────────────
+
+# ── Dataclasses matching parquet_schema.py 1:1 ──────────────────────────────
 
 @dataclass
 class GameRecord:
+    """Fields match GAMES_SCHEMA exactly."""
     game_id: str = ""
+    game_order: Optional[int] = None
     event: str = ""
     site: str = ""
-    date: str = ""
+    date_played: str = ""
     round: str = ""
     white: str = ""
     black: str = ""
     result: str = ""
     white_elo: int = 0
+    white_rating_diff: Optional[int] = None
     black_elo: int = 0
-    time_control: str = ""
+    black_rating_diff: Optional[int] = None
+    white_title: Optional[str] = None
+    black_title: Optional[str] = None
+    winner: Optional[str] = None
+    winner_elo: Optional[int] = None
+    loser: Optional[str] = None
+    loser_elo: Optional[int] = None
+    winner_loser_elo_diff: Optional[int] = None
     eco: str = ""
-    opening: str = ""
+    termination: Optional[str] = None
+    time_control: str = ""
+    utc_date: Optional[str] = None
+    utc_time: Optional[str] = None
+    variant: Optional[str] = None
+    ply_count: int = 0
+    game_hash: str = ""
+    evaluated_by: str = ""
+    evaluator_version: str = ""
+    evaluated_at: Optional[str] = None
     pgn_text: str = ""
-    num_moves: int = 0
+
+
+@dataclass
+class MoveRecord:
+    """Fields match MOVES_SCHEMA exactly."""
+    game_id: str = ""
+    move_no: int = 0
+    move_no_pair: int = 0
+    player: str = ""
+    notation: str = ""
+    move: str = ""
+    from_square: str = ""
+    to_square: str = ""
+    piece: str = ""
+    promotion: Optional[str] = None
+    color: str = ""
+    fen_before: str = ""
+    fen_after: str = ""
+    time_remaining: Optional[float] = None
+    time_spent: Optional[float] = None
+    game_to_position: str = ""
+    white_win_perc_before: Optional[float] = None
+    black_win_perc_before: Optional[float] = None
+    draw_perc_before: Optional[float] = None
+    white_win_perc_after: Optional[float] = None
+    black_win_perc_after: Optional[float] = None
+    draw_perc_after: Optional[float] = None
+    static_eval_before: Optional[float] = None
+    static_eval_after: Optional[float] = None
+    eval_before: Optional[float] = None
+    mate_count_before: Optional[float] = None
+    eval_after: Optional[float] = None
+    mate_count_after: Optional[float] = None
     evaluated_by: str = ""
     evaluator_version: str = ""
 
 
 @dataclass
-class MoveRecord:
-    game_id: str = ""
-    ply: int = 0
-    fen: str = ""
-    move_uci: str = ""
-    move_san: str = ""
-    score_cp: Optional[int] = None
-    score_mate: Optional[int] = None
-    top_move_uci: str = ""
-    top_move_san: str = ""
-    top_score_cp: Optional[int] = None
-    top_score_mate: Optional[int] = None
-    is_best_move: bool = False
-    evaluated_by: str = ""
-
-
-@dataclass
 class PossibleMoveRecord:
+    """Fields match POSSIBLE_MOVES_SCHEMA exactly."""
     game_id: str = ""
-    ply: int = 0
-    fen: str = ""
-    move_uci: str = ""
-    move_san: str = ""
-    score_cp: Optional[int] = None
-    score_mate: Optional[int] = None
-    rank: int = 0
-    prior_probability: float = 0.0
-    visits: int = 0
+    move_no: int = 0
+    move_no_pair: int = 0
+    notation: str = ""
+    move: str = ""
+    from_square: str = ""
+    to_square: str = ""
+    piece: str = ""
+    promotion: Optional[str] = None
+    color: str = ""
+    fen_before: str = ""
+    fen_after: str = ""
+    eval: Optional[float] = None
+    mate_count: Optional[float] = None
+    white_win_perc: Optional[float] = None
+    black_win_perc: Optional[float] = None
+    draw_perc: Optional[float] = None
+    nodes: int = 0
+    depth: int = 0
+    pv: Optional[str] = None
     evaluated_by: str = ""
+    evaluator_version: str = ""
 
 
-# Arrow schemas for the three tables
-GAME_SCHEMA = pa.schema([
-    ("game_id", pa.string()),
-    ("event", pa.string()),
-    ("site", pa.string()),
-    ("date", pa.string()),
-    ("round", pa.string()),
-    ("white", pa.string()),
-    ("black", pa.string()),
-    ("result", pa.string()),
-    ("white_elo", pa.int32()),
-    ("black_elo", pa.int32()),
-    ("time_control", pa.string()),
-    ("eco", pa.string()),
-    ("opening", pa.string()),
-    ("pgn_text", pa.string()),
-    ("num_moves", pa.int32()),
-    ("evaluated_by", pa.string()),
-    ("evaluator_version", pa.string()),
-])
-
-MOVE_SCHEMA = pa.schema([
-    ("game_id", pa.string()),
-    ("ply", pa.int32()),
-    ("fen", pa.string()),
-    ("move_uci", pa.string()),
-    ("move_san", pa.string()),
-    ("score_cp", pa.int32()),
-    ("score_mate", pa.int32()),
-    ("top_move_uci", pa.string()),
-    ("top_move_san", pa.string()),
-    ("top_score_cp", pa.int32()),
-    ("top_score_mate", pa.int32()),
-    ("is_best_move", pa.bool_()),
-    ("evaluated_by", pa.string()),
-])
-
-POSSIBLE_MOVE_SCHEMA = pa.schema([
-    ("game_id", pa.string()),
-    ("ply", pa.int32()),
-    ("fen", pa.string()),
-    ("move_uci", pa.string()),
-    ("move_san", pa.string()),
-    ("score_cp", pa.int32()),
-    ("score_mate", pa.int32()),
-    ("rank", pa.int32()),
-    ("prior_probability", pa.float64()),
-    ("visits", pa.int32()),
-    ("evaluated_by", pa.string()),
-])
+def _to_dict(record) -> dict:
+    """Convert a dataclass or dict to dict."""
+    if isinstance(record, dict):
+        return record
+    return asdict(record)
 
 
 class ParquetWriter:
     """
     Buffered parquet writer that flushes batches to sequentially-numbered
-    part files.  Each flush produces a NEW file — no overwrites.
+    part files. Each flush produces a NEW file — no overwrites.
 
     Output structure:
         output_dir/
           games/
             part_000000.parquet
-            part_000001.parquet
-            ...
           moves/
             part_000000.parquet
-            ...
           possible_moves/
             part_000000.parquet
-            ...
     """
 
     def __init__(
@@ -179,34 +173,34 @@ class ParquetWriter:
 
     # ── Public API ───────────────────────────────────────────────────────
 
-    def write_game(self, record: GameRecord):
-        self._game_buffer.append(asdict(record))
+    def write_game(self, record):
+        self._game_buffer.append(_to_dict(record))
         if len(self._game_buffer) >= self._batch_sizes["games"]:
-            self._flush_buffer("games", self._game_buffer, GAME_SCHEMA)
+            self._flush_buffer("games", self._game_buffer, GAMES_SCHEMA)
             self._game_buffer = []
 
-    def write_move(self, record: MoveRecord):
-        self._move_buffer.append(asdict(record))
+    def write_move(self, record):
+        self._move_buffer.append(_to_dict(record))
         if len(self._move_buffer) >= self._batch_sizes["moves"]:
-            self._flush_buffer("moves", self._move_buffer, MOVE_SCHEMA)
+            self._flush_buffer("moves", self._move_buffer, MOVES_SCHEMA)
             self._move_buffer = []
 
-    def write_possible_move(self, record: PossibleMoveRecord):
-        self._possible_move_buffer.append(asdict(record))
+    def write_possible_move(self, record):
+        self._possible_move_buffer.append(_to_dict(record))
         if len(self._possible_move_buffer) >= self._batch_sizes["possible_moves"]:
-            self._flush_buffer("possible_moves", self._possible_move_buffer, POSSIBLE_MOVE_SCHEMA)
+            self._flush_buffer("possible_moves", self._possible_move_buffer, POSSIBLE_MOVES_SCHEMA)
             self._possible_move_buffer = []
 
     def flush(self):
         """Flush all remaining buffered data to disk."""
         if self._game_buffer:
-            self._flush_buffer("games", self._game_buffer, GAME_SCHEMA)
+            self._flush_buffer("games", self._game_buffer, GAMES_SCHEMA)
             self._game_buffer = []
         if self._move_buffer:
-            self._flush_buffer("moves", self._move_buffer, MOVE_SCHEMA)
+            self._flush_buffer("moves", self._move_buffer, MOVES_SCHEMA)
             self._move_buffer = []
         if self._possible_move_buffer:
-            self._flush_buffer("possible_moves", self._possible_move_buffer, POSSIBLE_MOVE_SCHEMA)
+            self._flush_buffer("possible_moves", self._possible_move_buffer, POSSIBLE_MOVES_SCHEMA)
             self._possible_move_buffer = []
 
     def close(self):
@@ -219,11 +213,14 @@ class ParquetWriter:
         if not buffer:
             return
 
-        # Replace None with 0 for non-nullable int columns
+        # Replace None with appropriate zero for non-nullable columns
         for row in buffer:
             for key, val in row.items():
                 if val is None:
-                    arrow_field = schema.field(key)
+                    try:
+                        arrow_field = schema.field(key)
+                    except KeyError:
+                        continue
                     if arrow_field.type in (pa.int32(), pa.int64()):
                         row[key] = 0
                     elif arrow_field.type == pa.float64():
@@ -231,7 +228,7 @@ class ParquetWriter:
 
         table = pa.Table.from_pylist(buffer, schema=schema)
 
-        # FIX: each flush gets its own file number — never overwrite
+        # Each flush gets its own file number — never overwrite
         counter = self._file_counters[table_name]
         if self.worker_id is not None:
             filename = f"worker{self.worker_id:02d}_part_{counter:06d}.parquet"
