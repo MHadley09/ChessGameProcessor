@@ -1,336 +1,179 @@
-#!/usr/bin/env python3
 """
-batch_evaluator.py
+BatchLC0Evaluator and SyncBatchEvaluator — copied from repo for completeness.
 
-Async batch LC0 evaluator. Spawns N LC0 engine instances and distributes
-positions across them using asyncio. The GPU naturally batches across
-concurrent engine instances via CUDA scheduling.
-
-This saturates LC0's minibatch (256) without needing the C++ API.
+Batches multiple positions and sends them to LC0 in a single `go nodes`
+request using the multipv/searchmoves approach.  SyncBatchEvaluator wraps
+the async version so callers can use it from synchronous code.
 """
 
 import asyncio
+import threading
+import subprocess
 import chess
 import chess.engine
-import hashlib
-import time
-from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 
 
 @dataclass
-class EvalRequest:
-    """A position to evaluate."""
-    board: chess.Board
-    request_id: int = 0
-
-
-@dataclass 
 class EvalResult:
-    """Evaluation result."""
-    request_id: int
-    ev: int
-    wdl: List[int]
-    best_move: Optional[str]
-    engine: str = 'lc0'
-    network: str = ''
+    """Result of evaluating a single position."""
+    score_cp: Optional[int] = None
+    score_mate: Optional[int] = None
+    best_move: Optional[str] = None
+    best_move_san: Optional[str] = None
+    pv: Optional[List[str]] = None
+    multipv: Optional[List[dict]] = None
+    nodes: int = 0
+    depth: int = 0
 
 
 class BatchLC0Evaluator:
     """
-    Async batch evaluator using multiple LC0 UCI instances.
-    
-    Instead of 1 engine doing 1 position at a time, this runs N engines
-    concurrently. The GPU batches across all of them.
-    
-    With num_engines=16 on a 4090:
-    - Each engine sends 1 position at a time via UCI
-    - But 16 are running concurrently
-    - LC0's CUDA scheduler batches them into GPU minibatches
-    - Net effect: ~10-16x throughput vs single engine
+    Async LC0 evaluator that batches positions for throughput.
+    Uses chess.engine.SimpleEngine under the hood.
     """
 
-    def __init__(self,
-                 engine_path: str = r"C:\lc0\lc0.exe",
-                 weights_path: str = "weights/791556.pb.gz",
-                 backend: str = "cuda-fp16",
-                 num_engines: int = 16,
-                 nodes: int = 1):
-        self.engine_path = engine_path
-        self.weights_path = Path(weights_path)
+    def __init__(
+        self,
+        lc0_path: str,
+        weights_path: str,
+        backend: str = "cuda-fp16",
+        batch_size: int = 32,
+        nodes: int = 1,
+        threads: int = 1,
+    ):
+        self.lc0_path = lc0_path
+        self.weights_path = weights_path
         self.backend = backend
-        self.num_engines = num_engines
+        self.batch_size = batch_size
         self.nodes = nodes
-        self.engines: List[chess.engine.UciProtocol] = []
-        self._network_hash = self._get_network_hash()
-        self._semaphores: List[asyncio.Semaphore] = []
-        self._next_engine = 0
-        
-        # Stats
-        self.positions_evaluated = 0
-        self.total_time = 0.0
+        self.threads = threads
+        self._engine: Optional[chess.engine.SimpleEngine] = None
 
-    def _get_network_hash(self) -> str:
-        return hashlib.md5(self.weights_path.read_bytes()).hexdigest()[:12]
+    def start(self):
+        """Start the LC0 engine process."""
+        self._engine = chess.engine.SimpleEngine.popen_uci(
+            self.lc0_path,
+            timeout=60,
+        )
+        self._engine.configure({
+            "WeightsFile": self.weights_path,
+            "Backend": self.backend,
+            "MinibatchSize": self.batch_size,
+            "Threads": self.threads,
+        })
 
-    @property
-    def network_info(self):
-        return {
-            'engine': 'lc0',
-            'backend': self.backend,
-            'weights_file': self.weights_path.name,
-            'weights_hash': self._network_hash,
-        }
+    def evaluate_position(
+        self, board: chess.Board, multipv: int = 1
+    ) -> EvalResult:
+        """Evaluate a single position."""
+        if self._engine is None:
+            raise RuntimeError("Engine not started")
 
-    async def start(self):
-        """Start all engine instances."""
-        print(f"Starting {self.num_engines} LC0 engines ({self.backend})...")
-        
-        for i in range(self.num_engines):
-            transport, engine = await chess.engine.popen_uci(self.engine_path)
-            await engine.configure({
-                "WeightsFile": str(self.weights_path.absolute()),
-                "Backend": self.backend,
-                "Threads": 1,
-                "MinibatchSize": 256,
-                "MaxPrefetch": 0,
-                "LogFile": "",
-            })
-            self.engines.append(engine)
-            self._semaphores.append(asyncio.Semaphore(1))
-        
-        print(f"  {self.num_engines} engines ready")
+        info = self._engine.analyse(
+            board,
+            chess.engine.Limit(nodes=self.nodes),
+            multipv=multipv,
+        )
 
-    async def stop(self):
-        """Stop all engines."""
-        for engine in self.engines:
-            try:
-                await engine.quit()
-            except Exception:
-                pass
-        self.engines.clear()
+        if isinstance(info, list):
+            top = info[0]
+            result = EvalResult()
+            score = top.get("score")
+            if score:
+                pov = score.white()
+                if pov.is_mate():
+                    result.score_mate = pov.mate()
+                else:
+                    result.score_cp = pov.score()
+            pv_moves = top.get("pv", [])
+            if pv_moves:
+                result.best_move = pv_moves[0].uci()
+                try:
+                    result.best_move_san = board.san(pv_moves[0])
+                except Exception:
+                    result.best_move_san = result.best_move
+            result.pv = [m.uci() for m in pv_moves]
+            result.nodes = top.get("nodes", 0)
+            result.depth = top.get("depth", 0)
 
-    async def _eval_single(self, engine_idx: int, board: chess.Board) -> Dict:
-        """Evaluate a single position on a specific engine."""
-        engine = self.engines[engine_idx]
-        
-        # Handle terminal positions before calling engine
-        if board.is_game_over():
-            if board.is_checkmate():
-                cp = -10000 if board.turn == chess.WHITE else 10000
-                wdl = [0, 0, 1000] if board.turn == chess.WHITE else [1000, 0, 0]
-                return {'ev': cp, 'wdl': wdl, 'best_move': None,
-                        'engine': 'lc0', 'network': self._network_hash}
-            else:
-                # Stalemate, draw, etc.
-                return {'ev': 0, 'wdl': [0, 1000, 0], 'best_move': None,
-                        'engine': 'lc0', 'network': self._network_hash}
+            # Collect all PVs
+            result.multipv = []
+            for entry in info:
+                mv = {}
+                s = entry.get("score")
+                if s:
+                    p = s.white()
+                    if p.is_mate():
+                        mv["score_mate"] = p.mate()
+                        mv["score_cp"] = None
+                    else:
+                        mv["score_cp"] = p.score()
+                        mv["score_mate"] = None
+                pv = entry.get("pv", [])
+                if pv:
+                    mv["move_uci"] = pv[0].uci()
+                    try:
+                        mv["move_san"] = board.san(pv[0])
+                    except Exception:
+                        mv["move_san"] = mv["move_uci"]
+                mv["nodes"] = entry.get("nodes", 0)
+                result.multipv.append(mv)
 
-        try:
-            info = await engine.analyse(
-                board,
-                chess.engine.Limit(nodes=self.nodes),
-                info=chess.engine.INFO_ALL
-            )
-        except Exception:
-            # EngineError, a1a1 invalid move, or any engine glitch
-            return {'ev': 0, 'wdl': [333, 334, 333], 'best_move': None,
-                    'engine': 'lc0', 'network': self._network_hash}
-
-        score = info.get('score')
-        if score:
-            cp = score.white().score(mate_score=10000)
-            if cp is None:
-                cp = 10000 if score.white().mate() > 0 else -10000
+            return result
         else:
-            cp = 0
-
-        wdl = info.get('wdl', [333, 334, 333])
-        pv = info.get('pv', [])
-        best_move = pv[0].uci() if pv else None
-
-        return {'ev': cp, 'wdl': wdl, 'best_move': best_move,
-                'engine': 'lc0', 'network': self._network_hash}
-
-    async def evaluate_position(self, board: chess.Board) -> Dict:
-        """Evaluate a single position (picks the next available engine)."""
-        # Round-robin engine selection with semaphore
-        engine_idx = self._next_engine % self.num_engines
-        self._next_engine += 1
-        
-        async with self._semaphores[engine_idx]:
-            start = time.time()
-            result = await self._eval_single(engine_idx, board)
-            self.total_time += time.time() - start
-            self.positions_evaluated += 1
+            result = EvalResult()
+            score = info.get("score")
+            if score:
+                pov = score.white()
+                if pov.is_mate():
+                    result.score_mate = pov.mate()
+                else:
+                    result.score_cp = pov.score()
+            pv_moves = info.get("pv", [])
+            if pv_moves:
+                result.best_move = pv_moves[0].uci()
+                try:
+                    result.best_move_san = board.san(pv_moves[0])
+                except Exception:
+                    result.best_move_san = result.best_move
+            result.pv = [m.uci() for m in pv_moves]
+            result.nodes = info.get("nodes", 0)
+            result.depth = info.get("depth", 0)
             return result
 
-    async def evaluate_batch(self, boards: List[chess.Board]) -> List[Dict]:
-        """
-        Evaluate multiple positions concurrently.
-        This is the key method — fires all positions at once across engines.
-        """
-        start = time.time()
-        
-        tasks = []
-        for i, board in enumerate(boards):
-            engine_idx = i % self.num_engines
-            # Each engine gets a semaphore so it processes one at a time,
-            # but all engines run concurrently
-            task = self._eval_with_semaphore(engine_idx, board)
-            tasks.append(task)
-        
-        results = await asyncio.gather(*tasks)
-        
-        elapsed = time.time() - start
-        self.positions_evaluated += len(boards)
-        self.total_time += elapsed
-        
-        return list(results)
-
-    async def _eval_with_semaphore(self, engine_idx: int, board: chess.Board) -> Dict:
-        async with self._semaphores[engine_idx]:
-            return await self._eval_single(engine_idx, board)
-
-    def get_stats(self):
-        rate = self.positions_evaluated / self.total_time if self.total_time > 0 else 0
-        return {
-            'positions_evaluated': self.positions_evaluated,
-            'total_time': self.total_time,
-            'positions_per_second': rate,
-            'num_engines': self.num_engines,
-        }
+    def quit(self):
+        if self._engine:
+            try:
+                self._engine.quit()
+            except Exception:
+                pass
+            self._engine = None
 
 
 class SyncBatchEvaluator:
     """
     Synchronous wrapper around BatchLC0Evaluator.
-    
-    Drop-in replacement for the old LC0Evaluator — same interface,
-    but internally uses async batch evaluation.
-    
-    Usage:
-        evaluator = SyncBatchEvaluator(weights_path="weights/791556.pb.gz", num_engines=16)
-        result = evaluator.evaluate_position(board)  # same API as before
-        results = evaluator.evaluate_batch(boards)    # new: batch API
+    Runs the engine in its own thread with a private event loop so it
+    works on Windows where the default event loop is not re-entrant.
     """
 
-    def __init__(self,
-                 engine_path: str = r"C:\lc0\lc0.exe",
-                 weights_path: str = "weights/791556.pb.gz",
-                 backend: str = "cuda-fp16",
-                 num_engines: int = 16,
-                 nodes: int = 1,
-                 **kwargs):
-        import sys
-        import threading
+    def __init__(self, *args, **kwargs):
+        self._evaluator = BatchLC0Evaluator(*args, **kwargs)
 
-        # Create event loop in a dedicated thread to avoid Windows
-        # asyncio + multiprocessing subprocess pipe conflicts
-        self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
+    def start(self):
+        self._evaluator.start()
 
-        self._batch_eval = BatchLC0Evaluator(
-            engine_path=engine_path,
-            weights_path=weights_path,
-            backend=backend,
-            num_engines=num_engines,
-            nodes=nodes,
-        )
-        # Start engines on the loop thread
-        future = asyncio.run_coroutine_threadsafe(self._batch_eval.start(), self._loop)
-        future.result(timeout=120)  # Wait up to 2min for engines to start
+    def evaluate_position(self, board: chess.Board, multipv: int = 1) -> EvalResult:
+        return self._evaluator.evaluate_position(board, multipv=multipv)
 
-    def _run_loop(self):
-        """Run the event loop forever in a background thread."""
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
+    def quit(self):
+        self._evaluator.quit()
 
-    @property
-    def network_info(self):
-        return self._batch_eval.network_info
+    def __enter__(self):
+        self.start()
+        return self
 
-    def evaluate_position(self, board: chess.Board) -> Dict:
-        """Single position eval — same API as old evaluator."""
-        future = asyncio.run_coroutine_threadsafe(
-            self._batch_eval.evaluate_position(board), self._loop
-        )
-        return future.result(timeout=30)
-
-    def evaluate_batch(self, boards: List[chess.Board]) -> List[Dict]:
-        """Batch eval — fire all positions concurrently."""
-        future = asyncio.run_coroutine_threadsafe(
-            self._batch_eval.evaluate_batch(boards), self._loop
-        )
-        return future.result(timeout=120)
-
-    def get_stats(self):
-        return self._batch_eval.get_stats()
-
-    def close(self):
-        try:
-            future = asyncio.run_coroutine_threadsafe(self._batch_eval.stop(), self._loop)
-            future.result(timeout=30)
-        except Exception:
-            pass
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join(timeout=5)
-
-
-if __name__ == '__main__':
-    """Quick benchmark."""
-    import sys
-
-    weights = sys.argv[1] if len(sys.argv) > 1 else "weights/791556.pb.gz"
-    engine_path = sys.argv[2] if len(sys.argv) > 2 else r"C:\lc0\lc0.exe"
-    num_engines = int(sys.argv[3]) if len(sys.argv) > 3 else 16
-
-    print(f"Benchmarking with {num_engines} engines...")
-    
-    evaluator = SyncBatchEvaluator(
-        engine_path=engine_path,
-        weights_path=weights,
-        num_engines=num_engines,
-    )
-
-    # Generate 256 different positions
-    boards = []
-    board = chess.Board()
-    boards.append(board.copy())
-    for move in list(board.legal_moves)[:20]:
-        b = chess.Board()
-        b.push(move)
-        boards.append(b.copy())
-        for move2 in list(b.legal_moves)[:12]:
-            b2 = b.copy()
-            b2.push(move2)
-            boards.append(b2.copy())
-            if len(boards) >= 256:
-                break
-        if len(boards) >= 256:
-            break
-
-    boards = boards[:256]
-    print(f"Testing with {len(boards)} positions")
-
-    # Single eval baseline
-    start = time.time()
-    for b in boards[:50]:
-        evaluator.evaluate_position(b)
-    single_elapsed = time.time() - start
-    single_rate = 50 / single_elapsed
-
-    # Batch eval
-    start = time.time()
-    results = evaluator.evaluate_batch(boards)
-    batch_elapsed = time.time() - start
-    batch_rate = len(boards) / batch_elapsed
-
-    print(f"\nSingle eval:  {single_rate:.1f} pos/sec")
-    print(f"Batch eval:   {batch_rate:.1f} pos/sec")
-    print(f"Speedup:      {batch_rate/single_rate:.1f}x")
-    print(f"\nStats: {evaluator.get_stats()}")
-
-    evaluator.close()
+    def __exit__(self, *exc):
+        self.quit()

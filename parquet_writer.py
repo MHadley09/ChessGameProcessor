@@ -1,185 +1,257 @@
-#!/usr/bin/env python3
 """
-parquet_writer.py
+ParquetWriter — Fixed version that doesn't overwrite data on each flush.
 
-Compatible with lc0_processor_with_parquet.py
-Uses typed dataclass records with add_game/add_move/add_possible_move.
+BUG FIX: The original _flush() called pq.write_table(table, output_file) which
+OVERWRITES the file every time. With batch_size=10000 and max_rows_per_file=100000,
+the first 9 flushes to _000000.parquet each destroyed the previous data. Only the
+last 10K rows survived per file rotation.
+
+FIX: Each flush increments file_counter so every batch lands in its own file.
+This is simple, safe, and lets downstream readers use pyarrow.parquet.ParquetDataset
+to read all part files transparently.
 """
 
-import sys
+from dataclasses import dataclass, field, asdict
+from typing import List, Optional
 from pathlib import Path
-from typing import List, Dict, Optional
-from dataclasses import dataclass, field
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pandas as pd
 
+
+# ── Schemas ──────────────────────────────────────────────────────────────────
 
 @dataclass
 class GameRecord:
-    """Game metadata record — matches parquet games schema"""
-    game_id: str = None
-    game_order: int = None
-    event: Optional[str] = None
-    site: Optional[str] = None
-    date_played: Optional[str] = None
-    round: Optional[str] = None
-    white: Optional[str] = None           # SHA-256 hashed
-    black: Optional[str] = None           # SHA-256 hashed
-    result: Optional[str] = None
-    white_elo: Optional[int] = None
-    white_rating_diff: Optional[int] = None
-    black_elo: Optional[int] = None
-    black_rating_diff: Optional[int] = None
-    white_title: Optional[str] = None
-    black_title: Optional[str] = None
-    winner: Optional[str] = None
-    winner_elo: Optional[int] = None
-    loser: Optional[str] = None
-    loser_elo: Optional[int] = None
-    winner_loser_elo_diff: Optional[int] = None
-    eco: Optional[str] = None
-    termination: Optional[str] = None
-    time_control: Optional[str] = None
-    utc_date: Optional[str] = None
-    utc_time: Optional[str] = None
-    variant: Optional[str] = None
-    ply_count: Optional[int] = None
-    game_hash: Optional[str] = None
-    evaluated_by: str = 'lc0'
-    evaluator_version: str = 'unknown'
-    evaluated_at: Optional[str] = None
-    pgn_text: Optional[str] = None
+    game_id: str = ""
+    event: str = ""
+    site: str = ""
+    date: str = ""
+    round: str = ""
+    white: str = ""
+    black: str = ""
+    result: str = ""
+    white_elo: int = 0
+    black_elo: int = 0
+    time_control: str = ""
+    eco: str = ""
+    opening: str = ""
+    pgn_text: str = ""
+    num_moves: int = 0
+    evaluated_by: str = ""
+    evaluator_version: str = ""
 
 
 @dataclass
 class MoveRecord:
-    """Actual move record — matches parquet moves schema"""
-    game_id: str = None
-    move_no: int = None
-    move_no_pair: int = None
-    player: Optional[str] = None          # SHA-256 hashed
-    notation: Optional[str] = None        # SAN
-    move: Optional[str] = None            # UCI
-    from_square: Optional[str] = None
-    to_square: Optional[str] = None
-    piece: Optional[str] = None
-    promotion: Optional[str] = None
-    color: Optional[str] = None
-    fen_before: Optional[str] = None
-    fen_after: Optional[str] = None
-    time_remaining: Optional[float] = None
-    time_spent: Optional[float] = None
-    game_to_position: Optional[str] = None
-    white_win_perc_before: Optional[float] = None
-    black_win_perc_before: Optional[float] = None
-    draw_perc_before: Optional[float] = None
-    white_win_perc_after: Optional[float] = None
-    black_win_perc_after: Optional[float] = None
-    draw_perc_after: Optional[float] = None
-    static_eval_before: Optional[float] = None
-    static_eval_after: Optional[float] = None
-    eval_before: Optional[float] = None
-    mate_count_before: Optional[float] = None
-    eval_after: Optional[float] = None
-    mate_count_after: Optional[float] = None
-    evaluated_by: str = 'lc0'
-    evaluator_version: str = 'unknown'
+    game_id: str = ""
+    ply: int = 0
+    fen: str = ""
+    move_uci: str = ""
+    move_san: str = ""
+    score_cp: Optional[int] = None
+    score_mate: Optional[int] = None
+    top_move_uci: str = ""
+    top_move_san: str = ""
+    top_score_cp: Optional[int] = None
+    top_score_mate: Optional[int] = None
+    is_best_move: bool = False
+    evaluated_by: str = ""
 
 
 @dataclass
 class PossibleMoveRecord:
-    """Possible move record — matches parquet possible_moves schema"""
-    game_id: str = None
-    move_no: int = None
-    move_no_pair: int = None
-    notation: Optional[str] = None        # SAN
-    move: Optional[str] = None            # UCI
-    from_square: Optional[str] = None
-    to_square: Optional[str] = None
-    piece: Optional[str] = None
-    promotion: Optional[str] = None
-    color: Optional[str] = None
-    fen_before: Optional[str] = None
-    fen_after: Optional[str] = None
-    eval: Optional[float] = None
-    mate_count: Optional[float] = None
-    white_win_perc: Optional[float] = None
-    black_win_perc: Optional[float] = None
-    draw_perc: Optional[float] = None
-    evaluated_by: str = 'lc0'
-    evaluator_version: str = 'unknown'
+    game_id: str = ""
+    ply: int = 0
+    fen: str = ""
+    move_uci: str = ""
+    move_san: str = ""
+    score_cp: Optional[int] = None
+    score_mate: Optional[int] = None
+    rank: int = 0
+    prior_probability: float = 0.0
+    visits: int = 0
+    evaluated_by: str = ""
+
+
+# Arrow schemas for the three tables
+GAME_SCHEMA = pa.schema([
+    ("game_id", pa.string()),
+    ("event", pa.string()),
+    ("site", pa.string()),
+    ("date", pa.string()),
+    ("round", pa.string()),
+    ("white", pa.string()),
+    ("black", pa.string()),
+    ("result", pa.string()),
+    ("white_elo", pa.int32()),
+    ("black_elo", pa.int32()),
+    ("time_control", pa.string()),
+    ("eco", pa.string()),
+    ("opening", pa.string()),
+    ("pgn_text", pa.string()),
+    ("num_moves", pa.int32()),
+    ("evaluated_by", pa.string()),
+    ("evaluator_version", pa.string()),
+])
+
+MOVE_SCHEMA = pa.schema([
+    ("game_id", pa.string()),
+    ("ply", pa.int32()),
+    ("fen", pa.string()),
+    ("move_uci", pa.string()),
+    ("move_san", pa.string()),
+    ("score_cp", pa.int32()),
+    ("score_mate", pa.int32()),
+    ("top_move_uci", pa.string()),
+    ("top_move_san", pa.string()),
+    ("top_score_cp", pa.int32()),
+    ("top_score_mate", pa.int32()),
+    ("is_best_move", pa.bool_()),
+    ("evaluated_by", pa.string()),
+])
+
+POSSIBLE_MOVE_SCHEMA = pa.schema([
+    ("game_id", pa.string()),
+    ("ply", pa.int32()),
+    ("fen", pa.string()),
+    ("move_uci", pa.string()),
+    ("move_san", pa.string()),
+    ("score_cp", pa.int32()),
+    ("score_mate", pa.int32()),
+    ("rank", pa.int32()),
+    ("prior_probability", pa.float64()),
+    ("visits", pa.int32()),
+    ("evaluated_by", pa.string()),
+])
 
 
 class ParquetWriter:
-    """Writes chess evaluation data to Parquet files"""
+    """
+    Buffered parquet writer that flushes batches to sequentially-numbered
+    part files.  Each flush produces a NEW file — no overwrites.
 
-    def __init__(self,
-                 output_dir: str,
-                 schema_type: str = 'games',
-                 batch_size: int = 10000,
-                 max_rows_per_file: int = 100000,
-                 **kwargs):
+    Output structure:
+        output_dir/
+          games/
+            part_000000.parquet
+            part_000001.parquet
+            ...
+          moves/
+            part_000000.parquet
+            ...
+          possible_moves/
+            part_000000.parquet
+            ...
+    """
+
+    def __init__(
+        self,
+        output_dir: str,
+        games_batch_size: int = 10_000,
+        moves_batch_size: int = 10_000,
+        possible_moves_batch_size: int = 10_000,
+        worker_id: Optional[int] = None,
+    ):
         self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.schema_type = schema_type
-        self.batch_size = batch_size
-        self.max_rows_per_file = max_rows_per_file
+        self._batch_sizes = {
+            "games": games_batch_size,
+            "moves": moves_batch_size,
+            "possible_moves": possible_moves_batch_size,
+        }
+        self.worker_id = worker_id
 
-        self.batch = []
-        self.file_counter = 0
-        self.rows_in_current_file = 0
+        # Separate counters per table type
+        self._file_counters = {"games": 0, "moves": 0, "possible_moves": 0}
 
-        if schema_type == 'games':
-            self.filename_prefix = 'games'
-        elif schema_type == 'moves':
-            self.filename_prefix = 'moves'
-        elif schema_type == 'possible_moves':
-            self.filename_prefix = 'possible_moves'
-        else:
-            raise ValueError(f"Unknown schema_type: {schema_type}")
+        # Buffers
+        self._game_buffer: List[dict] = []
+        self._move_buffer: List[dict] = []
+        self._possible_move_buffer: List[dict] = []
 
-    def add_game(self, game: GameRecord):
-        self.batch.append(game)
-        if len(self.batch) >= self.batch_size:
-            self._flush()
+        # Totals
+        self.games_written = 0
+        self.moves_written = 0
+        self.possible_moves_written = 0
 
-    def add_move(self, move: MoveRecord):
-        self.batch.append(move)
-        if len(self.batch) >= self.batch_size:
-            self._flush()
+        # Create dirs
+        for sub in ("games", "moves", "possible_moves"):
+            (self.output_dir / sub).mkdir(parents=True, exist_ok=True)
 
-    def add_possible_move(self, pm: PossibleMoveRecord):
-        self.batch.append(pm)
-        if len(self.batch) >= self.batch_size:
-            self._flush()
+    # ── Public API ───────────────────────────────────────────────────────
 
-    def _flush(self):
-        if not self.batch:
-            return
+    def write_game(self, record: GameRecord):
+        self._game_buffer.append(asdict(record))
+        if len(self._game_buffer) >= self._batch_sizes["games"]:
+            self._flush_buffer("games", self._game_buffer, GAME_SCHEMA)
+            self._game_buffer = []
 
-        df = pd.DataFrame([r.__dict__ for r in self.batch])
-        output_file = self.output_dir / f"{self.filename_prefix}_{self.file_counter:06d}.parquet"
+    def write_move(self, record: MoveRecord):
+        self._move_buffer.append(asdict(record))
+        if len(self._move_buffer) >= self._batch_sizes["moves"]:
+            self._flush_buffer("moves", self._move_buffer, MOVE_SCHEMA)
+            self._move_buffer = []
 
-        table = pa.Table.from_pandas(df)
-        pq.write_table(table, output_file, compression='ZSTD')
+    def write_possible_move(self, record: PossibleMoveRecord):
+        self._possible_move_buffer.append(asdict(record))
+        if len(self._possible_move_buffer) >= self._batch_sizes["possible_moves"]:
+            self._flush_buffer("possible_moves", self._possible_move_buffer, POSSIBLE_MOVE_SCHEMA)
+            self._possible_move_buffer = []
 
-        print(f"Wrote {len(self.batch)} {self.schema_type} to {output_file.name}")
-        self.rows_in_current_file += len(self.batch)
-        self.batch = []
-
-        if self.rows_in_current_file >= self.max_rows_per_file:
-            self.file_counter += 1
-            self.rows_in_current_file = 0
-
-    def flush_all(self):
-        self._flush()
+    def flush(self):
+        """Flush all remaining buffered data to disk."""
+        if self._game_buffer:
+            self._flush_buffer("games", self._game_buffer, GAME_SCHEMA)
+            self._game_buffer = []
+        if self._move_buffer:
+            self._flush_buffer("moves", self._move_buffer, MOVE_SCHEMA)
+            self._move_buffer = []
+        if self._possible_move_buffer:
+            self._flush_buffer("possible_moves", self._possible_move_buffer, POSSIBLE_MOVE_SCHEMA)
+            self._possible_move_buffer = []
 
     def close(self):
-        self.flush_all()
+        """Flush and finalize."""
+        self.flush()
+
+    # ── Internal ─────────────────────────────────────────────────────────
+
+    def _flush_buffer(self, table_name: str, buffer: List[dict], schema: pa.Schema):
+        if not buffer:
+            return
+
+        # Replace None with 0 for non-nullable int columns
+        for row in buffer:
+            for key, val in row.items():
+                if val is None:
+                    arrow_field = schema.field(key)
+                    if arrow_field.type in (pa.int32(), pa.int64()):
+                        row[key] = 0
+                    elif arrow_field.type == pa.float64():
+                        row[key] = 0.0
+
+        table = pa.Table.from_pylist(buffer, schema=schema)
+
+        # FIX: each flush gets its own file number — never overwrite
+        counter = self._file_counters[table_name]
+        if self.worker_id is not None:
+            filename = f"worker{self.worker_id:02d}_part_{counter:06d}.parquet"
+        else:
+            filename = f"part_{counter:06d}.parquet"
+        output_path = self.output_dir / table_name / filename
+        self._file_counters[table_name] = counter + 1
+
+        pq.write_table(table, str(output_path), compression="snappy")
+
+        count = len(buffer)
+        if table_name == "games":
+            self.games_written += count
+        elif table_name == "moves":
+            self.moves_written += count
+        else:
+            self.possible_moves_written += count
 
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, *exc):
         self.close()
