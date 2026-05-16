@@ -27,6 +27,7 @@ import multiprocessing as mp
 from multiprocessing import Process, Queue
 from pathlib import Path
 from typing import Optional, List, Set, Tuple
+from datetime import datetime
 
 import chess
 import chess.pgn
@@ -556,7 +557,8 @@ def lc0_worker(
     if metrics:
         metrics.register_worker(worker_id, 'lc0')
 
-    worker_output = os.path.join(output_dir, f"worker_{worker_id:02d}")
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S') 	
+    worker_output = os.path.join(output_dir, f"worker_{worker_id:02d}_{timestamp}")
     writer = ParquetWriter(worker_output, worker_id=worker_id)
 
     # Validate paths before spawn

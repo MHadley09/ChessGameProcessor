@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-train_mimo_opus.py — Training script for the MIMO Opus chess model.
+train_mimo.py — Training script for the MIMO chess model.
 
 Features:
     - Mixed-precision (AMP) training for RTX 4090 efficiency
@@ -13,10 +13,10 @@ Features:
     - Reproducible with --seed
 
 Usage:
-    python train_mimo_opus.py \
-        --train-data data/mimo_opus_dataset/train.npz \
-        --val-data   data/mimo_opus_dataset/val.npz \
-        --output-dir checkpoints/opus_run1 \
+    python train_mimo.py \
+        --train-data data/mimo_dataset/train.npz \
+        --val-data   data/mimo_dataset/val.npz \
+        --output-dir checkpoints/run1 \
         --epochs 30 \
         --batch-size 64 \
         --lr 3e-4 \
@@ -33,10 +33,11 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 
-from chess_mimo_model_opus import ChessMIMOModelOpus, MIMOLossOpus
+from chess_mimo_model import ChessMIMOModel, MIMOLoss
+from mimo_dataset import MIMOCompactDataset
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -46,44 +47,9 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Dataset
+# Dataset — uses MIMOCompactDataset from mimo_dataset.py
+# (planes built on-the-fly from FEN, no pre-stored planes)
 # ---------------------------------------------------------------------------
-
-class MIMONpzDataset(Dataset):
-    """Loads a .npz file produced by mimo_dataset_opus.py."""
-
-    def __init__(self, npz_path: str):
-        print(f"[DATA] Loading {npz_path} …")
-        data = np.load(npz_path)
-        self.current_planes  = data['current_planes']     # (N, 47, 8, 8)
-        self.possible_planes = data['possible_planes']     # (N, M, 47, 8, 8)
-        self.possible_scalars= data['possible_scalars']    # (N, M, 6)
-        self.possible_mask   = data['possible_mask']       # (N, M)
-        self.tabular         = data['tabular']             # (N, 10)
-        self.actual_idx      = data['actual_idx']          # (N,)
-        self.is_mistake      = data['is_mistake']          # (N,)
-        self.win_prob_before = data['win_prob_before']     # (N, 3)
-        self.win_prob_after  = data['win_prob_after']      # (N, 3)
-        self.time_spent_log  = data['time_spent_log']      # (N,)
-        self.n = len(self.current_planes)
-        print(f"[DATA] {self.n:,} examples loaded")
-
-    def __len__(self):
-        return self.n
-
-    def __getitem__(self, idx):
-        return {
-            'current_planes':  torch.from_numpy(self.current_planes[idx]).float(),
-            'possible_planes': torch.from_numpy(self.possible_planes[idx]).float(),
-            'possible_scalars':torch.from_numpy(self.possible_scalars[idx]).float(),
-            'possible_mask':   torch.from_numpy(self.possible_mask[idx]).float(),
-            'tabular':         torch.from_numpy(self.tabular[idx]).float(),
-            'actual_idx':      torch.tensor(self.actual_idx[idx], dtype=torch.long),
-            'is_mistake':      torch.tensor(self.is_mistake[idx], dtype=torch.float32),
-            'win_prob_before': torch.from_numpy(self.win_prob_before[idx]).float(),
-            'win_prob_after':  torch.from_numpy(self.win_prob_after[idx]).float(),
-            'time_spent_log':  torch.tensor(self.time_spent_log[idx], dtype=torch.float32),
-        }
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +105,7 @@ def train_epoch(model, loader, criterion, optimizer, scheduler, scaler,
         pm = batch['possible_mask'].to(device, non_blocking=True)
         tab = batch['tabular'].to(device, non_blocking=True)
         aidx = batch['actual_idx'].to(device, non_blocking=True)
+        gphase = batch['game_phase'].to(device, non_blocking=True)
 
         targets = {
             'move_idx':        aidx,
@@ -151,7 +118,7 @@ def train_epoch(model, loader, criterion, optimizer, scheduler, scaler,
         optimizer.zero_grad(set_to_none=True)
 
         with autocast(enabled=use_amp):
-            outputs = model(cp, pp, ps, pm, tab, actual_idx=aidx)
+            outputs = model(cp, pp, ps, pm, tab, actual_idx=aidx, game_phase=gphase)
             loss, loss_dict = criterion(outputs, targets)
 
         if use_amp:
@@ -203,6 +170,7 @@ def validate(model, loader, criterion, device, use_amp):
         pm = batch['possible_mask'].to(device, non_blocking=True)
         tab = batch['tabular'].to(device, non_blocking=True)
         aidx = batch['actual_idx'].to(device, non_blocking=True)
+        gphase = batch['game_phase'].to(device, non_blocking=True)
 
         targets = {
             'move_idx':        aidx,
@@ -213,7 +181,7 @@ def validate(model, loader, criterion, device, use_amp):
         }
 
         with autocast(enabled=use_amp):
-            outputs = model(cp, pp, ps, pm, tab, actual_idx=aidx)
+            outputs = model(cp, pp, ps, pm, tab, actual_idx=aidx, game_phase=gphase)
             loss, loss_dict = criterion(outputs, targets)
 
         running_loss += loss.item()
@@ -254,10 +222,10 @@ def validate(model, loader, criterion, device, use_amp):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description='Train MIMO Opus model')
-    parser.add_argument('--train-data', required=True, help='.npz from mimo_dataset_opus')
+    parser = argparse.ArgumentParser(description='Train MIMO model')
+    parser.add_argument('--train-data', required=True, help='.npz from mimo_dataset')
     parser.add_argument('--val-data',   required=True, help='.npz for validation')
-    parser.add_argument('--output-dir', default='checkpoints/opus', help='Output directory')
+    parser.add_argument('--output-dir', default='checkpoints', help='Output directory')
     parser.add_argument('--epochs',     type=int,   default=30)
     parser.add_argument('--batch-size', type=int,   default=64)
     parser.add_argument('--lr',         type=float, default=3e-4)
@@ -272,7 +240,7 @@ def main():
     parser.add_argument('--no-amp',     action='store_true', help='Disable mixed precision')
     parser.add_argument('--seed',       type=int, default=42)
     parser.add_argument('--save-every', type=int, default=1, help='Checkpoint every N epochs')
-    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from (e.g. checkpoints/opus/latest.pt)')
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from (e.g. checkpoints/latest.pt)')
     args = parser.parse_args()
 
     # Reproducibility
@@ -287,8 +255,8 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Data ----
-    train_ds = MIMONpzDataset(args.train_data)
-    val_ds   = MIMONpzDataset(args.val_data)
+    train_ds = MIMOCompactDataset(args.train_data)
+    val_ds   = MIMOCompactDataset(args.val_data)
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -300,7 +268,7 @@ def main():
     )
 
     # ---- Model ----
-    model = ChessMIMOModelOpus(
+    model = ChessMIMOModel(
         cnn_channels=args.cnn_channels,
         num_res_blocks=args.res_blocks,
         tabular_dim=18,
@@ -309,12 +277,12 @@ def main():
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"\n[MODEL] ChessMIMOModelOpus — {n_params:,} parameters")
+    print(f"\n[MODEL] ChessMIMOModel — {n_params:,} parameters")
     print(f"        CNN channels={args.cnn_channels}, res_blocks={args.res_blocks}, "
           f"hidden={args.hidden_dim}, max_moves={args.max_possible}")
 
     # ---- Optimiser / scheduler ----
-    criterion = MIMOLossOpus().to(device)
+    criterion = MIMOLoss().to(device)
     all_params = list(model.parameters()) + list(criterion.parameters())
     optimizer = torch.optim.AdamW(all_params, lr=args.lr, weight_decay=args.weight_decay)
 
@@ -335,7 +303,6 @@ def main():
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         start_epoch = ckpt['epoch'] + 1
         best_val_loss = ckpt.get('val_loss', float('inf'))
-        # Fast-forward scheduler to correct step
         steps_done = ckpt['epoch'] * len(train_loader)
         for _ in range(steps_done):
             scheduler.step()

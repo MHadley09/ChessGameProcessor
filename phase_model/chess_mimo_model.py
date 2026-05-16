@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-chess_mimo_model_opus.py — Multi-Input Multi-Output Chess Behavior Prediction Model
+chess_mimo_model.py — Multi-Input Multi-Output Chess Behavior Prediction Model
 
 Architecture overview:
     ┌─────────────────────────────────────────────────────────────────────┐
     │                         INPUTS                                      │
     │  current_planes (B,47,8,8)  tabular (B,10)  possible_planes (B,M,47,8,8) │
     │                                             possible_scalars (B,M,6)│
+    │                              game_phase (B,) int 0/1/2              │
     └────────┬──────────────────────┬─────────────────┬───────────────────┘
              │                      │                 │
      ┌───────▼───────┐   ┌─────────▼──────┐  ┌───────▼────────┐
@@ -39,7 +40,7 @@ Masking strategy:
     - win_prob_after: sees everything incl. actual move embedding, no game result
     - time_spent: time_spent excluded from tabular features entirely
 
-Author: Sskeer (mimo_opus)
+Author: Sskeer
 """
 
 import math
@@ -190,7 +191,7 @@ class PossibleMoveScalarEncoder(nn.Module):
 # Main Model
 # ---------------------------------------------------------------------------
 
-class ChessMIMOModelOpus(nn.Module):
+class ChessMIMOModel(nn.Module):
     """
     Multi-Input Multi-Output model for predicting human chess behaviour.
 
@@ -240,6 +241,10 @@ class ChessMIMOModelOpus(nn.Module):
             input_dim=move_scalar_dim, output_dim=32
         )
 
+        # ---- Game-phase embedding (opening=0, middlegame=1, endgame=2) ----
+        self.phase_embedding = nn.Embedding(3, 16)
+        phase_emb_dim = 16
+
         # ---- Possible-move projection ----
         # CNN output (128) + scalar encoder output (32) → hidden_dim
         move_emb_dim = cnn_channels + 32
@@ -250,24 +255,22 @@ class ChessMIMOModelOpus(nn.Module):
         )
 
         # ---- Cross-attention: context queries, candidate-move keys/values ----
-        # Query dimension = cnn_channels + tabular_out = 128 + 64 = 192
-        self.query_proj = nn.Linear(cnn_channels + 64, hidden_dim)
+        # Query dimension = cnn_channels + tabular_out + phase_emb = 128 + 64 + 16 = 208
+        self.query_proj = nn.Linear(cnn_channels + 64 + phase_emb_dim, hidden_dim)
         self.cross_attn = nn.MultiheadAttention(
             hidden_dim, num_heads=num_attn_heads, dropout=dropout, batch_first=True,
         )
         self.attn_norm = nn.LayerNorm(hidden_dim)
 
         # ---- Gated cross-attention ----
-        # Learned gate controls how much attention output contributes to fusion.
-        # Worst case: gate ≈ 1.0 everywhere → equivalent to ungated architecture.
         self.attn_gate = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.Sigmoid(),
         )
 
         # ---- Fusion MLP ----
-        # Input: board_emb (128) + tabular (64) + attn_output (256) = 448
-        fusion_in = cnn_channels + 64 + hidden_dim
+        # Input: board_emb (128) + tabular (64) + phase (16) + attn_output (256) = 464
+        fusion_in = cnn_channels + 64 + phase_emb_dim + hidden_dim
         self.fusion = nn.Sequential(
             nn.Linear(fusion_in, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -410,6 +413,7 @@ class ChessMIMOModelOpus(nn.Module):
         possible_mask: torch.Tensor,
         tabular: torch.Tensor,
         actual_idx: Optional[torch.Tensor] = None,
+        game_phase: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Full forward pass with built-in masking for win_prob_before.
@@ -427,6 +431,9 @@ class ChessMIMOModelOpus(nn.Module):
               - win_prob_before masking
               - win_prob_after (selects actual move embedding)
             At inference time, pass None to get everything except those two heads.
+        game_phase : (B,) long or None
+            Game phase index: 0=opening, 1=middlegame, 2=endgame.
+            If None, defaults to middlegame (1) for all samples.
 
         Returns
         -------
@@ -446,12 +453,17 @@ class ChessMIMOModelOpus(nn.Module):
         # --- Encode tabular ---
         tab_emb = self.tabular_encoder(tabular)              # (B, 64)
 
+        # --- Game phase embedding ---
+        if game_phase is None:
+            game_phase = torch.ones(B, dtype=torch.long, device=current_planes.device)
+        phase_emb = self.phase_embedding(game_phase)         # (B, 16)
+
         # --- Encode all candidate moves ---
         move_emb = self._encode_possible_moves(possible_planes, possible_scalars)
         # move_emb: (B, M, hidden_dim)
 
-        # --- Context vector ---
-        context = torch.cat([board_emb, tab_emb], dim=-1)    # (B, 192)
+        # --- Context vector (includes phase) ---
+        context = torch.cat([board_emb, tab_emb, phase_emb], dim=-1)  # (B, 208)
 
         # Padding mask for attention (True = ignore)
         pad_mask = (possible_mask == 0)                      # (B, M)
@@ -461,7 +473,7 @@ class ChessMIMOModelOpus(nn.Module):
         attn_out = self.attn_gate(attn_out) * attn_out              # gated
 
         # --- Fusion ---
-        fused = torch.cat([board_emb, tab_emb, attn_out], dim=-1)  # (B, 448)
+        fused = torch.cat([board_emb, tab_emb, phase_emb, attn_out], dim=-1)  # (B, 464)
         global_hidden = self.fusion(fused)                          # (B, 256)
 
         outputs: Dict[str, torch.Tensor] = {}
@@ -485,7 +497,7 @@ class ChessMIMOModelOpus(nn.Module):
 
             attn_out_masked = self._cross_attend(context, move_emb, pad_mask_before)
             attn_out_masked = self.attn_gate(attn_out_masked) * attn_out_masked  # gated
-            fused_masked = torch.cat([board_emb, tab_emb, attn_out_masked], dim=-1)
+            fused_masked = torch.cat([board_emb, tab_emb, phase_emb, attn_out_masked], dim=-1)
             global_hidden_masked = self.fusion(fused_masked)
             wdl_before = F.softmax(
                 self.wdl_before_head(global_hidden_masked), dim=-1
@@ -532,7 +544,7 @@ class ChessMIMOModelOpus(nn.Module):
 # Loss
 # ---------------------------------------------------------------------------
 
-class MIMOLossOpus(nn.Module):
+class MIMOLoss(nn.Module):
     """
     Multi-task loss with learnable uncertainty-based weighting
     (Kendall, Gal & Cipolla 2018).
@@ -624,20 +636,21 @@ if __name__ == '__main__':
     torch.manual_seed(42)
     B, M = 4, 40
 
-    model = ChessMIMOModelOpus(max_possible=M)
+    model = ChessMIMOModel(max_possible=M)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
 
     # Dummy inputs
     current = torch.randn(B, 47, 8, 8)
     poss_planes = torch.randn(B, M, 47, 8, 8)
-    poss_scalars = torch.randn(B, M, 6)
+    poss_scalars = torch.randn(B, M, 11)
     poss_mask = torch.ones(B, M)
     poss_mask[:, 25:] = 0  # last 15 are padding
-    tabular = torch.randn(B, 10)
+    tabular = torch.randn(B, 18)
     actual_idx = torch.randint(0, 25, (B,))
+    game_phase = torch.randint(0, 3, (B,))
 
-    outputs = model(current, poss_planes, poss_scalars, poss_mask, tabular, actual_idx)
+    outputs = model(current, poss_planes, poss_scalars, poss_mask, tabular, actual_idx, game_phase)
     print("\nOutputs:")
     for k, v in outputs.items():
         print(f"  {k:20s} {tuple(v.shape)}")
@@ -650,7 +663,7 @@ if __name__ == '__main__':
         'win_prob_after': F.softmax(torch.randn(B, 3), dim=-1),
         'time_spent_log': torch.rand(B) * 4,
     }
-    criterion = MIMOLossOpus()
+    criterion = MIMOLoss()
     loss, ld = criterion(outputs, targets)
     print(f"\nTotal loss: {loss.item():.4f}")
     for k, v in ld.items():

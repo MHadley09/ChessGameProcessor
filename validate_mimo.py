@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-validate_mimo_opus.py — Comprehensive validation for all 5 MIMO Opus heads.
+validate_mimo.py — Comprehensive validation for all 5 MIMO heads.
 
 Metrics computed:
     1. move_logits:       Top-1/3/5 accuracy, perplexity
@@ -16,9 +16,9 @@ Outputs:
     - calibration.png    — calibration curves (4 subplots)
 
 Usage:
-    python validate_mimo_opus.py \
-        --checkpoint checkpoints/opus/best.pt \
-        --data       data/mimo_opus_dataset/test.npz \
+    python validate_mimo.py \
+        --checkpoint checkpoints/best.pt \
+        --data       data/mimo_dataset/test.npz \
         --output-dir validation_results
 """
 
@@ -32,7 +32,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from chess_mimo_model_opus import ChessMIMOModelOpus
+from chess_mimo_model import ChessMIMOModel
+from mimo_dataset import MIMOCompactDataset
 
 # Optional sklearn / matplotlib
 try:
@@ -56,40 +57,9 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Dataset (same as training but read-only)
+# Dataset — uses MIMOCompactDataset from mimo_dataset.py
+# (planes built on-the-fly from FEN, no pre-stored planes)
 # ---------------------------------------------------------------------------
-
-class ValDataset(torch.utils.data.Dataset):
-    def __init__(self, npz_path):
-        data = np.load(npz_path)
-        self.current_planes  = data['current_planes']
-        self.possible_planes = data['possible_planes']
-        self.possible_scalars= data['possible_scalars']
-        self.possible_mask   = data['possible_mask']
-        self.tabular         = data['tabular']
-        self.actual_idx      = data['actual_idx']
-        self.is_mistake      = data['is_mistake']
-        self.win_prob_before = data['win_prob_before']
-        self.win_prob_after  = data['win_prob_after']
-        self.time_spent_log  = data['time_spent_log']
-        self.n = len(self.current_planes)
-
-    def __len__(self):
-        return self.n
-
-    def __getitem__(self, idx):
-        return {
-            'current_planes':  torch.from_numpy(self.current_planes[idx]).float(),
-            'possible_planes': torch.from_numpy(self.possible_planes[idx]).float(),
-            'possible_scalars':torch.from_numpy(self.possible_scalars[idx]).float(),
-            'possible_mask':   torch.from_numpy(self.possible_mask[idx]).float(),
-            'tabular':         torch.from_numpy(self.tabular[idx]).float(),
-            'actual_idx':      torch.tensor(self.actual_idx[idx], dtype=torch.long),
-            'is_mistake':      torch.tensor(self.is_mistake[idx], dtype=torch.float32),
-            'win_prob_before': torch.from_numpy(self.win_prob_before[idx]).float(),
-            'win_prob_after':  torch.from_numpy(self.win_prob_after[idx]).float(),
-            'time_spent_log':  torch.tensor(self.time_spent_log[idx], dtype=torch.float32),
-        }
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +363,7 @@ def _plot_multiclass_cal(ax, preds, targets, title, n_bins=10):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description='Validate MIMO Opus')
+    parser = argparse.ArgumentParser(description='Validate MIMO')
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--data',       required=True, help='.npz test set')
     parser.add_argument('--output-dir', default='validation_results')
@@ -410,7 +380,7 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     cfg = ckpt.get('config', {})
 
-    model = ChessMIMOModelOpus(
+    model = ChessMIMOModel(
         cnn_channels=cfg.get('cnn_channels', 128),
         num_res_blocks=cfg.get('res_blocks', 6),
         tabular_dim=18,
@@ -423,7 +393,7 @@ def main():
           f"{sum(p.numel() for p in model.parameters()):,} params")
 
     # Load data
-    ds = ValDataset(args.data)
+    ds = MIMOCompactDataset(args.data)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
     print(f"Validating on {len(ds):,} examples …")
 

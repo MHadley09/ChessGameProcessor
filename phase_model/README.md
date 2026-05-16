@@ -1,10 +1,10 @@
-# MIMO Opus with Phase — Chess Behaviour Prediction Model
+# MIMO with Phase — Chess Behaviour Prediction Model
 
 **Multi-Input Multi-Output** model predicting human chess behaviour from
 board position, candidate moves, game context, **and game phase**.
 
-This is the **opus_with_phase** variant. The only difference from base
-`mimo_opus` is the addition of a learned game-phase embedding
+This is the **with_phase** variant. The only difference from base
+`mimo` is the addition of a learned game-phase embedding
 (opening / middlegame / endgame) that is concatenated into the context
 before cross-attention and fusion.
 
@@ -117,10 +117,10 @@ eval = good for STM; stm_win = STM's winning probability.
 
 | File | Description |
 |------|-------------|
-| `chess_mimo_model_opus.py` | Model + loss (PyTorch) |
-| `mimo_dataset_opus.py` | Parquet → .npz dataset builder with multiprocessing |
-| `train_mimo_opus.py` | Training loop with AMP, warmup-cosine, uncertainty weighting |
-| `validate_mimo_opus.py` | Comprehensive 5-head validation + leakage detection |
+| `chess_mimo_model.py` | Model + loss (PyTorch) |
+| `mimo_dataset.py` | Parquet → .npz dataset builder with multiprocessing |
+| `train_mimo.py` | Training loop with AMP, warmup-cosine, uncertainty weighting |
+| `validate_mimo.py` | Comprehensive 5-head validation + leakage detection |
 | `README.md` | This file |
 
 ---
@@ -130,11 +130,11 @@ eval = good for STM; stm_win = STM's winning probability.
 ### 1. Build dataset
 
 ```bash
-python mimo_dataset_opus.py \
+python mimo_dataset.py \
     --moves  data/actual_moves/ \
     --games  data/games/ \
     --possible data/possible_moves/ \
-    --output-dir data/opus_dataset \
+    --output-dir data/dataset \
     --max-possible 40 \
     --min-elo 0 \
     --max-elo 0 \
@@ -148,10 +148,10 @@ Both `--min-elo` and `--max-elo` default to 0 (off). Set to any value 1-9999 to 
 ### 2. Train
 
 ```bash
-python train_mimo_opus.py \
-    --train-data data/opus_dataset/train.npz \
-    --val-data   data/opus_dataset/val.npz \
-    --output-dir checkpoints/opus_run1 \
+python train_mimo.py \
+    --train-data data/dataset/train.npz \
+    --val-data   data/dataset/val.npz \
+    --output-dir checkpoints/run1 \
     --epochs 30 \
     --batch-size 64 \
     --lr 3e-4 \
@@ -161,10 +161,10 @@ python train_mimo_opus.py \
 ### 3. Validate
 
 ```bash
-python validate_mimo_opus.py \
-    --checkpoint checkpoints/opus_run1/best.pt \
-    --data       data/opus_dataset/test.npz \
-    --output-dir results/opus_run1
+python validate_mimo.py \
+    --checkpoint checkpoints/run1/best.pt \
+    --data       data/dataset/test.npz \
+    --output-dir results/run1
 ```
 
 ---
@@ -173,7 +173,7 @@ python validate_mimo_opus.py \
 
 ### vs v1 (chess_mimo_model_with_time_spent)
 
-| Aspect | v1 | Opus |
+| Aspect | v1 | Current |
 |--------|-----|------|
 | CNN | 3 conv layers, no residuals | 6 ResBlocks + 3 SE blocks |
 | Possible moves | Scalar only (B,218,4) | Full 47-plane CNN + scalar (B,40,6) |
@@ -188,7 +188,7 @@ python validate_mimo_opus.py \
 
 ### vs v2 (train_chess_mimo_v2_with_arch_flag)
 
-| Aspect | v2 | Opus |
+| Aspect | v2 | Current |
 |--------|-----|------|
 | time_spent leak | YES (tabular index 1) | NO — excluded from tabular entirely |
 | Forward passes | 2 (full + masked) | 1 (masking integrated in model) |
@@ -199,7 +199,7 @@ python validate_mimo_opus.py \
 
 ### vs v3 (mimo_avocado)
 
-| Aspect | v3 | Opus |
+| Aspect | v3 | Current |
 |--------|-----|------|
 | CNN depth | 3 conv layers | 6 ResBlocks + SE |
 | Per-move scalars | None (planes only) | 6-dim (eval, WDL, nodes, depth) |
@@ -243,7 +243,7 @@ Plane encoding: 47 planes from `plane_codec.py` (current + 2-history positions).
 
 ---
 
-## Game-Phase Embedding (opus_with_phase only)
+## Game-Phase Embedding (with_phase only)
 
 ### What it is
 
@@ -286,7 +286,7 @@ number, so it correctly identifies early endgames from exchanges.
 - Also included in fusion: board (128) + tabular (64) + **phase (16)** + attn (256) = 464
 - Backward compatible: if `game_phase=None` is passed, defaults to middlegame (1)
 
-### Difference from base opus
+### Difference from base mimo
 
 This is the **only** difference. All other architecture, masking, features,
-and training logic are identical to `mimo_opus`.
+and training logic are identical to `mimo`.
