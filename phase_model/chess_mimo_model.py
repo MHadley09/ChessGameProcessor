@@ -224,7 +224,7 @@ class ChessMIMOModel(nn.Module):
         hidden_dim: int = 256,
         num_attn_heads: int = 4,
         dropout: float = 0.2,
-        move_scalar_dim: int = 11,
+        move_scalar_dim: int = 12,
     ):
         super().__init__()
         self.max_possible = max_possible

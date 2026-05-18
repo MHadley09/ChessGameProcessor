@@ -1,68 +1,48 @@
 #!/usr/bin/env python3
 """
-mimo_dataset.py — Compact dataset for the MIMO chess model.
+mimo_dataset.py — Compact dataset for the MIMO chess model (per-worker streaming, chunked processing).
 
-Reads directly from Parquet files produced by the LC0 processing pipeline
-(games + moves + possible_moves). Stores only compact data per position:
-FEN strings, candidate UCI moves, tabular scalars, per-candidate scalars,
-and labels. Board planes (47×8×8) are constructed on-the-fly in __getitem__
-from FEN using python-chess — never pre-computed or stored.
+Reads from Parquet files produced by LC0 processing pipeline.
+Processes one worker directory at a time with chunked task generation to avoid OOM.
+Stores compact data: FENs, UCI moves, scalars, labels. Planes built on-the-fly.
 
-Storage: ~2 KB/position (vs ~495 KB with pre-stored planes).
-At 45M positions: ~90 GB compact vs ~22 TB with planes.
-
-Two modes:
-  1. --build: Read parquet → produce train/val/test .npz with compact data
-  2. MIMOCompactDataset: PyTorch Dataset that loads .npz and builds planes on-the-fly
-
-Usage:
-    python mimo_dataset.py \\
-        --data-dir  output/lc0/791556 \\
-        --output-dir data/mimo_dataset \\
-        --max-possible 40 \\
-        --workers 8
+This version processes moves in chunks of 100K to avoid building giant task lists.
 """
 
 import argparse
 import json
 import math
 import os
+import gc
+import sys
 import traceback
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from multiprocessing import Pool
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# Force line buffering for immediate output on Windows
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(line_buffering=True)
+
 import chess
 import numpy as np
 import pandas as pd
-import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
 
+print("Imports complete, starting...", flush=True)
+
 
 # ---------------------------------------------------------------------------
-# Plane codec (inlined for self-containment)
+# Plane codec
 # ---------------------------------------------------------------------------
 
-def board_to_planes(board: chess.Board,
-                    history: Optional[List[Tuple[int, int]]] = None) -> np.ndarray:
-    """
-    Convert a chess.Board to 47×8×8 plane representation.
-
-    Planes 0-11:  current position pieces (P N B R Q K white, then black)
-    Planes 12-23: t-1 position pieces
-    Planes 24-35: t-2 position pieces
-    Planes 36-37: last move from/to (t-1)
-    Planes 38-39: last move from/to (t-2)
-    Plane  40:    side to move (1.0 = white)
-    Planes 41-44: castling rights (WK, WQ, BK, BQ)
-    Plane  45:    en passant target square
-    Plane  46:    fifty-move counter / 100
-    """
+def board_to_planes(board: chess.Board, history: Optional[List[Tuple[int, int]]] = None) -> np.ndarray:
     planes = np.zeros((47, 8, 8), dtype=np.float32)
-
     for pt in range(1, 7):
         for color in (chess.WHITE, chess.BLACK):
             idx = (pt - 1) + 6 * color
@@ -74,7 +54,11 @@ def board_to_planes(board: chess.Board,
             temp = board.copy()
             if temp.move_stack and len(history) >= 1:
                 temp.pop()
-                _fill_piece_planes(temp, planes, offset=12)
+                for pt in range(1, 7):
+                    for color in (chess.WHITE, chess.BLACK):
+                        idx = 12 + (pt - 1) + 6 * color
+                        for sq in temp.pieces(pt, color):
+                            planes[idx, 7 - sq // 8, sq % 8] = 1.0
         except Exception:
             pass
         try:
@@ -82,7 +66,11 @@ def board_to_planes(board: chess.Board,
             if len(temp2.move_stack) >= 2 and len(history) >= 2:
                 temp2.pop()
                 temp2.pop()
-                _fill_piece_planes(temp2, planes, offset=24)
+                for pt in range(1, 7):
+                    for color in (chess.WHITE, chess.BLACK):
+                        idx = 24 + (pt - 1) + 6 * color
+                        for sq in temp2.pieces(pt, color):
+                            planes[idx, 7 - sq // 8, sq % 8] = 1.0
         except Exception:
             pass
 
@@ -105,16 +93,7 @@ def board_to_planes(board: chess.Board,
     if board.ep_square is not None:
         planes[45, 7 - board.ep_square // 8, board.ep_square % 8] = 1.0
     planes[46, :, :] = min(board.halfmove_clock, 100) / 100.0
-
     return planes
-
-
-def _fill_piece_planes(board: chess.Board, planes: np.ndarray, offset: int):
-    for pt in range(1, 7):
-        for color in (chess.WHITE, chess.BLACK):
-            idx = offset + (pt - 1) + 6 * color
-            for sq in board.pieces(pt, color):
-                planes[idx, 7 - sq // 8, sq % 8] = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +101,6 @@ def _fill_piece_planes(board: chess.Board, planes: np.ndarray, offset: int):
 # ---------------------------------------------------------------------------
 
 def parse_game_to_position(gtp_str: str) -> List[Tuple[int, int]]:
-    """Parse 'e2e4,d7d5,...' string into list of (from_sq, to_sq) tuples."""
     if not gtp_str or (isinstance(gtp_str, float) and math.isnan(gtp_str)):
         return []
     moves = []
@@ -137,13 +115,10 @@ def parse_game_to_position(gtp_str: str) -> List[Tuple[int, int]]:
 
 
 def result_to_wdl(result: str, color: str) -> np.ndarray:
-    """Convert game result to [win, draw, loss] from color's perspective."""
     if result == '1-0':
-        return np.array([1., 0., 0.], dtype=np.float32) if color == 'White' \
-            else np.array([0., 0., 1.], dtype=np.float32)
+        return np.array([1., 0., 0.], dtype=np.float32) if color == 'White' else np.array([0., 0., 1.], dtype=np.float32)
     elif result == '0-1':
-        return np.array([1., 0., 0.], dtype=np.float32) if color == 'Black' \
-            else np.array([0., 0., 1.], dtype=np.float32)
+        return np.array([1., 0., 0.], dtype=np.float32) if color == 'Black' else np.array([0., 0., 1.], dtype=np.float32)
     else:
         return np.array([0., 1., 0.], dtype=np.float32)
 
@@ -158,7 +133,6 @@ def _safe_float(val, default: float = 0.0) -> float:
 
 
 def parse_time_control(tc) -> Tuple[float, float]:
-    """Parse '300+3' → (initial_seconds, increment_seconds)."""
     if not tc or (isinstance(tc, float) and math.isnan(tc)):
         return 0.0, 0.0
     tc = str(tc).strip()
@@ -170,43 +144,13 @@ def parse_time_control(tc) -> Tuple[float, float]:
             return float(parts[0]), float(parts[1])
         except (ValueError, IndexError):
             return 0.0, 0.0
-    if '/' in tc:
-        parts = tc.split('/')
-        try:
-            return float(parts[1]) if len(parts) > 1 else 0.0, 0.0
-        except (ValueError, IndexError):
-            return 0.0, 0.0
     try:
         return float(tc), 0.0
     except ValueError:
         return 0.0, 0.0
 
 
-def classify_game_phase(fen: str, move_no: int) -> int:
-    """
-    Classify game phase from FEN and move number.
-
-    Returns 0=opening, 1=middlegame, 2=endgame.
-
-    Heuristic:
-        - Count non-pawn, non-king pieces (minor + major pieces) from FEN.
-        - Opening: move_no <= 12 AND minor_major >= 12  (early, most pieces)
-        - Endgame: minor_major <= 6  (few pieces regardless of move)
-        - Middlegame: everything else
-    """
-    piece_part = fen.split()[0]
-    minor_major = sum(1 for c in piece_part if c in 'nbrqNBRQ')
-
-    if move_no <= 12 and minor_major >= 12:
-        return 0   # opening
-    elif minor_major <= 6:
-        return 2   # endgame
-    else:
-        return 1   # middlegame
-
-
 def detect_prev_capture(game_to_position_str: str) -> float:
-    """Replay game_to_position moves; return 1.0 if the last move was a capture."""
     moves = parse_game_to_position(game_to_position_str)
     if not moves:
         return 0.0
@@ -214,43 +158,26 @@ def detect_prev_capture(game_to_position_str: str) -> float:
         replay = chess.Board()
         was_capture = False
         for from_sq, to_sq in moves:
-            matched = False
             for legal in replay.legal_moves:
                 if legal.from_square == from_sq and legal.to_square == to_sq:
                     was_capture = replay.is_capture(legal)
                     replay.push(legal)
-                    matched = True
                     break
-            if not matched:
-                for legal in replay.legal_moves:
-                    if legal.from_square == from_sq and legal.to_square == to_sq:
-                        was_capture = replay.is_capture(legal)
-                        replay.push(legal)
-                        break
         return 1.0 if was_capture else 0.0
     except Exception:
         return 0.0
 
 
 # ---------------------------------------------------------------------------
-# Single-example builder — compact version (NO planes stored)
+# Build one example (top-level for pickling)
 # ---------------------------------------------------------------------------
 
-def build_one_compact(args: Tuple) -> Optional[Dict[str, Any]]:
-    """
-    Build one compact training example.  Stores FEN strings and UCI moves
-    instead of pre-computed planes.  Planes are built at training time.
-
-    Returns None on failure.
-    """
-    move_dict, game_dict, possibles, max_possible = args
-
+def build_one_compact(move_dict: Dict, game_dict: Dict, possibles: List[Dict], max_possible: int, with_phase: bool) -> Optional[Dict[str, Any]]:
     fen_before = move_dict.get('fen_before', '')
     try:
         board = chess.Board(fen_before)
     except Exception:
         return None
-
     if not possibles:
         return None
 
@@ -259,12 +186,10 @@ def build_one_compact(args: Tuple) -> Optional[Dict[str, Any]]:
     w_elo = _safe_float(game_dict.get('white_elo'), 1500)
     b_elo = _safe_float(game_dict.get('black_elo'), 1500)
 
-    # --- Sort possible moves by eval (best first) and cap ---
     possibles = sorted(possibles, key=lambda x: _safe_float(x.get('eval'), -99999), reverse=True)
     possibles = possibles[:max_possible]
     num_possible = len(possibles)
 
-    # --- Compute STM-normalized evals ---
     evals_stm = []
     for pm in possibles:
         e = _safe_float(pm.get('eval'), 0)
@@ -273,7 +198,6 @@ def build_one_compact(args: Tuple) -> Optional[Dict[str, Any]]:
     worst_eval_stm = min(evals_stm) if evals_stm else 0.0
     eval_range = best_eval_stm - worst_eval_stm
 
-    # --- Encode per-candidate scalars (11-dim) + store UCI + FEN ---
     poss_scalars_list: List[np.ndarray] = []
     poss_uci_list: List[str] = []
     poss_fen_after_list: List[str] = []
@@ -282,7 +206,6 @@ def build_one_compact(args: Tuple) -> Optional[Dict[str, Any]]:
     for i, pm in enumerate(possibles):
         poss_uci_list.append(pm.get('move', ''))
         poss_fen_after_list.append(pm.get('fen_after', ''))
-
         pm_eval_stm = evals_stm[i]
 
         if color == 'White':
@@ -327,18 +250,17 @@ def build_one_compact(args: Tuple) -> Optional[Dict[str, Any]]:
             is_capture,
             is_check,
             is_checkmate,
+            _safe_float(pm.get('policy_prob'), 0.0),
         ], dtype=np.float32))
 
-    # Pad scalars to max_possible
     while len(poss_scalars_list) < max_possible:
-        poss_scalars_list.append(np.zeros(11, dtype=np.float32))
+        poss_scalars_list.append(np.zeros(12, dtype=np.float32))
         poss_uci_list.append('')
         poss_fen_after_list.append('')
 
     possible_mask = np.zeros(max_possible, dtype=np.float32)
     possible_mask[:num_possible] = 1.0
 
-    # --- Tabular features (18-dim) ---
     eval_raw = _safe_float(move_dict.get('eval_before'), 0)
     eval_stm = eval_raw if color == 'White' else -eval_raw
 
@@ -354,7 +276,6 @@ def build_one_compact(args: Tuple) -> Optional[Dict[str, Any]]:
     initial_time, increment = parse_time_control(game_dict.get('time_control', ''))
     prev_capture = detect_prev_capture(move_dict.get('game_to_position', ''))
     in_check = 1.0 if board.is_check() else 0.0
-
     eval_std = float(np.std(evals_stm)) / 1000.0 if len(evals_stm) > 1 else 0.0
     captures_arr = [s[8] for s in poss_scalars_list[:num_possible]]
     num_captures = sum(captures_arr) / max(num_possible, 1)
@@ -383,7 +304,6 @@ def build_one_compact(args: Tuple) -> Optional[Dict[str, Any]]:
         num_candidates,
     ], dtype=np.float32)
 
-    # --- Actual move index ---
     actual_uci = move_dict.get('move', '')
     actual_idx = -1
     for i, pm in enumerate(possibles):
@@ -391,7 +311,6 @@ def build_one_compact(args: Tuple) -> Optional[Dict[str, Any]]:
             actual_idx = i
             break
 
-    # --- Mistake detection (WDL-based) ---
     is_mistake = 0.0
     if actual_idx >= 0 and len(possibles) > 0:
         def _expected_score(pm_dict, clr):
@@ -421,13 +340,10 @@ def build_one_compact(args: Tuple) -> Optional[Dict[str, Any]]:
         best_es = _expected_score(possibles[best_idx], color)
         played_es = _expected_score(possibles[actual_idx], color)
         drop = best_es - played_es
-
         avg_elo = (w_elo + b_elo) / 2
         threshold = 0.20 if avg_elo < 1500 else (0.15 if avg_elo < 2500 else 0.10)
-
         if drop > threshold:
             is_mistake = 1.0
-
         if drop > 0.05 and is_mistake == 0.0:
             best_outcome = _outcome_class(possibles[best_idx], color)
             played_outcome = _outcome_class(possibles[actual_idx], color)
@@ -435,112 +351,161 @@ def build_one_compact(args: Tuple) -> Optional[Dict[str, Any]]:
             if outcome_rank[played_outcome] < outcome_rank[best_outcome]:
                 is_mistake = 1.0
 
-    # --- WDL targets ---
     wdl_before = result_to_wdl(game_result, color)
     color_after = 'Black' if color == 'White' else 'White'
     wdl_after = result_to_wdl(game_result, color_after)
-
-    # --- Time spent target (log scale) ---
     raw_ts = max(0.0, _safe_float(move_dict.get('time_spent')))
     time_spent_log = np.float32(math.log1p(raw_ts))
-
-    # --- Game phase (0=opening, 1=middlegame, 2=endgame) ---
-    game_phase = np.int64(classify_game_phase(
-        fen_before, int(_safe_float(move_dict.get('move_no'), 20))))
-
-    # --- game_to_position for history reconstruction at train time ---
     gtp = str(move_dict.get('game_to_position', '')) if move_dict.get('game_to_position') else ''
 
-    return {
-        # Compact: strings instead of planes
+    result = {
         'fen_before': fen_before,
         'game_to_position': gtp,
-        'possible_uci': poss_uci_list,         # list of max_possible UCI strings
-        'possible_fen_after': poss_fen_after_list,  # list of max_possible FEN strings
-        # Numeric arrays (small)
-        'possible_scalars': np.stack(poss_scalars_list),   # (M, 11)
-        'possible_mask': possible_mask,                     # (M,)
-        'tabular': tabular,                                 # (18,)
+        'possible_uci': poss_uci_list,
+        'possible_fen_after': poss_fen_after_list,
+        'possible_scalars': np.stack(poss_scalars_list),
+        'possible_mask': possible_mask,
+        'tabular': tabular,
         'actual_idx': np.int64(actual_idx),
         'is_mistake': np.float32(is_mistake),
-        'win_prob_before': wdl_before,                      # (3,)
-        'win_prob_after': wdl_after,                        # (3,)
+        'win_prob_before': wdl_before,
+        'win_prob_after': wdl_after,
         'time_spent_log': time_spent_log,
-        'game_phase': game_phase,
     }
+    
+    if with_phase:
+        game_phase = 0
+        try:
+            ply = int(_safe_float(move_dict.get('move_no'), 0))
+            if ply <= 20:
+                game_phase = 0
+            elif ply <= 60:
+                game_phase = 1
+            else:
+                game_phase = 2
+        except:
+            pass
+        result['game_phase'] = np.int64(game_phase)
+    
+    return result
+
+
+# Wrapper for executor (picklable)
+def build_one_compact_wrapper(args_tuple):
+    return build_one_compact(*args_tuple)
 
 
 # ---------------------------------------------------------------------------
-# PyTorch Dataset — on-the-fly plane construction
+# Sharded Dataset
 # ---------------------------------------------------------------------------
 
 class MIMOCompactDataset(Dataset):
-    """
-    Loads a compact .npz + string arrays and builds 47×8×8 planes on-the-fly
-    from FEN in __getitem__.
-
-    Expected .npz keys:
-        fen_before (N,) object array of FEN strings
-        game_to_position (N,) object array of GTP strings
-        possible_uci (N, M) object array of UCI strings
-        possible_fen_after (N, M) object array of FEN strings
-        possible_scalars (N, M, 11) float32
-        possible_mask (N, M) float32
-        tabular (N, 18) float32
-        actual_idx (N,) int64
-        is_mistake (N,) float32
-        win_prob_before (N, 3) float32
-        win_prob_after (N, 3) float32
-        time_spent_log (N,) float32
-        game_phase (N,) int64
-    """
-
-    def __init__(self, npz_path: str, max_possible: int = 40):
-        print(f"[DATA] Loading {npz_path} …")
-        data = np.load(npz_path, allow_pickle=True)
-        self.fen_before       = data['fen_before']           # (N,) object
-        self.game_to_position = data['game_to_position']     # (N,) object
-        self.possible_uci     = data['possible_uci']         # (N, M) object
-        self.possible_fen_after = data['possible_fen_after'] # (N, M) object
-        self.possible_scalars = data['possible_scalars']     # (N, M, 11)
-        self.possible_mask    = data['possible_mask']        # (N, M)
-        self.tabular          = data['tabular']              # (N, 18)
-        self.actual_idx       = data['actual_idx']           # (N,)
-        self.is_mistake       = data['is_mistake']           # (N,)
-        self.win_prob_before  = data['win_prob_before']      # (N, 3)
-        self.win_prob_after   = data['win_prob_after']       # (N, 3)
-        self.time_spent_log   = data['time_spent_log']       # (N,)
-        self.game_phase       = data['game_phase']           # (N,)
-        self.max_possible     = max_possible
-        self.n = len(self.fen_before)
-        print(f"[DATA] {self.n:,} examples loaded (compact, planes built on-the-fly)")
+    def __init__(self, data_path: str, max_possible: int = 40, cache_shards: int = 3, with_phase: bool = False):
+        self.data_path = Path(data_path)
+        self.max_possible = max_possible
+        self.cache_shards = cache_shards
+        self.with_phase = with_phase
+        
+        if self.data_path.is_dir():
+            self.shard_files = sorted([f for f in self.data_path.glob('*.npz')])
+            if not self.shard_files:
+                raise FileNotFoundError(f"No .npz shards in {data_path}")
+            self.shard_offsets = []
+            self.shard_counts = []
+            total = 0
+            for f in self.shard_files:
+                with np.load(f, allow_pickle=True) as data:
+                    n = len(data['fen_before'])
+                    self.shard_offsets.append(total)
+                    self.shard_counts.append(n)
+                    total += n
+            self.n = total
+            self._shard_cache = OrderedDict()
+        else:
+            data = np.load(self.data_path, allow_pickle=True)
+            self.fen_before = data['fen_before']
+            self.game_to_position = data['game_to_position']
+            self.possible_uci = data['possible_uci']
+            self.possible_fen_after = data['possible_fen_after']
+            self.possible_scalars = data['possible_scalars']
+            self.possible_mask = data['possible_mask']
+            self.tabular = data['tabular']
+            self.actual_idx = data['actual_idx']
+            self.is_mistake = data['is_mistake']
+            self.win_prob_before = data['win_prob_before']
+            self.win_prob_after = data['win_prob_after']
+            self.time_spent_log = data['time_spent_log']
+            if with_phase and 'game_phase' in data:
+                self.game_phase = data['game_phase']
+            self.n = len(self.fen_before)
+            self.shard_files = None
+        print(f"[DATA] {self.n:,} examples", flush=True)
 
     def __len__(self):
         return self.n
 
-    def __getitem__(self, idx):
-        fen = str(self.fen_before[idx])
-        gtp = str(self.game_to_position[idx])
+    def _load_shard(self, shard_idx):
+        if shard_idx in self._shard_cache:
+            self._shard_cache.move_to_end(shard_idx)
+            return self._shard_cache[shard_idx]
+        while len(self._shard_cache) >= self.cache_shards:
+            self._shard_cache.popitem(last=False)
+        data = np.load(self.shard_files[shard_idx], allow_pickle=True)
+        shard_data = {k: data[k] for k in data.files}
+        self._shard_cache[shard_idx] = shard_data
+        return shard_data
 
-        # Build current position planes from FEN
+    def __getitem__(self, idx):
+        if self.shard_files:
+            shard_idx = 0
+            while shard_idx < len(self.shard_offsets) - 1 and idx >= self.shard_offsets[shard_idx + 1]:
+                shard_idx += 1
+            local_idx = idx - self.shard_offsets[shard_idx]
+            data = self._load_shard(shard_idx)
+            fen_before = str(data['fen_before'][local_idx])
+            gtp = str(data['game_to_position'][local_idx])
+            possible_uci = data['possible_uci'][local_idx]
+            possible_fen_after = data['possible_fen_after'][local_idx]
+            possible_scalars = data['possible_scalars'][local_idx]
+            possible_mask = data['possible_mask'][local_idx]
+            tabular = data['tabular'][local_idx]
+            actual_idx = int(data['actual_idx'][local_idx])
+            is_mistake = float(data['is_mistake'][local_idx])
+            win_prob_before = data['win_prob_before'][local_idx]
+            win_prob_after = data['win_prob_after'][local_idx]
+            time_spent_log = float(data['time_spent_log'][local_idx])
+            game_phase = int(data.get('game_phase', [0]*len(data['fen_before']))[local_idx]) if self.with_phase else 0
+        else:
+            fen_before = str(self.fen_before[idx])
+            gtp = str(self.game_to_position[idx])
+            possible_uci = self.possible_uci[idx]
+            possible_fen_after = self.possible_fen_after[idx]
+            possible_scalars = self.possible_scalars[idx]
+            possible_mask = self.possible_mask[idx]
+            tabular = self.tabular[idx]
+            actual_idx = int(self.actual_idx[idx])
+            is_mistake = float(self.is_mistake[idx])
+            win_prob_before = self.win_prob_before[idx]
+            win_prob_after = self.win_prob_after[idx]
+            time_spent_log = float(self.time_spent_log[idx])
+            game_phase = int(self.game_phase[idx]) if self.with_phase and hasattr(self, 'game_phase') else 0
+
         try:
-            board = chess.Board(fen)
+            board = chess.Board(fen_before)
             history = parse_game_to_position(gtp)
             recent = history[-2:] if history else []
             current_planes = board_to_planes(board, recent)
         except Exception:
             current_planes = np.zeros((47, 8, 8), dtype=np.float32)
-            board = None
             recent = []
 
-        # Build planes for each candidate move's resulting position
         poss_planes = np.zeros((self.max_possible, 47, 8, 8), dtype=np.float32)
         for i in range(self.max_possible):
-            if self.possible_mask[idx, i] < 0.5:
+            if possible_mask[i] < 0.5:
                 break
-            fen_after = str(self.possible_fen_after[idx, i])
-            uci = str(self.possible_uci[idx, i])
-            if not fen_after:
+            fen_after = str(possible_fen_after[i]) if i < len(possible_fen_after) else ''
+            uci = str(possible_uci[i]) if i < len(possible_uci) else ''
+            if not fen_after or not uci:
                 continue
             try:
                 board_after = chess.Board(fen_after)
@@ -551,204 +516,294 @@ class MIMOCompactDataset(Dataset):
             except Exception:
                 pass
 
-        return {
-            'current_planes':  torch.from_numpy(current_planes).float(),
+        out = {
+            'current_planes': torch.from_numpy(current_planes).float(),
             'possible_planes': torch.from_numpy(poss_planes).float(),
-            'possible_scalars': torch.from_numpy(self.possible_scalars[idx]).float(),
-            'possible_mask':   torch.from_numpy(self.possible_mask[idx]).float(),
-            'tabular':         torch.from_numpy(self.tabular[idx]).float(),
-            'actual_idx':      torch.tensor(self.actual_idx[idx], dtype=torch.long),
-            'is_mistake':      torch.tensor(self.is_mistake[idx], dtype=torch.float32),
-            'win_prob_before': torch.from_numpy(self.win_prob_before[idx]).float(),
-            'win_prob_after':  torch.from_numpy(self.win_prob_after[idx]).float(),
-            'time_spent_log':  torch.tensor(self.time_spent_log[idx], dtype=torch.float32),
-            'game_phase':      torch.tensor(self.game_phase[idx], dtype=torch.long),
+            'possible_scalars': torch.from_numpy(possible_scalars).float(),
+            'possible_mask': torch.from_numpy(possible_mask).float(),
+            'tabular': torch.from_numpy(tabular).float(),
+            'actual_idx': torch.tensor(actual_idx, dtype=torch.long),
+            'is_mistake': torch.tensor(is_mistake, dtype=torch.float32),
+            'win_prob_before': torch.from_numpy(win_prob_before).float(),
+            'win_prob_after': torch.from_numpy(win_prob_after).float(),
+            'time_spent_log': torch.tensor(time_spent_log, dtype=torch.float32),
         }
+        if self.with_phase:
+            out['game_phase'] = torch.tensor(game_phase, dtype=torch.long)
+        return out
 
 
 # ---------------------------------------------------------------------------
-# Main dataset builder
+# Process moves in chunks
 # ---------------------------------------------------------------------------
 
-def build_dataset(
-    data_dir: str,
-    output_dir: str,
-    max_possible: int = 40,
-    min_elo: int = 0,
-    max_elo: int = 0,
-    val_frac: float = 0.1,
-    test_frac: float = 0.05,
-    workers: int = 4,
-    seed: int = 42,
-):
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-
-    # ---- Load Parquet tables ----
-    print("[1/5] Loading parquet tables …")
-
-    def _load_table(root: Path, table_name: str) -> pd.DataFrame:
-        parquet_files = sorted(root.rglob(f'{table_name}/*.parquet'))
-        if not parquet_files:
-            flat = root / f'{table_name}.parquet'
-            if flat.is_file():
-                return pq.read_table(str(flat)).to_pandas()
-            raise FileNotFoundError(
-                f"No parquet files found for '{table_name}' under {root}")
-        tables = [pq.read_table(str(f)) for f in parquet_files]
-        combined = pa.concat_tables(tables)
-        print(f"       {table_name}: merged {len(parquet_files)} files "
-              f"from {len(set(f.parent.parent.name for f in parquet_files))} workers")
-        return combined.to_pandas()
-
-    root = Path(data_dir)
-    moves_df = _load_table(root, 'moves')
-    games_df = _load_table(root, 'games').set_index('game_id')
-    poss_df  = _load_table(root, 'possible_moves')
-    print(f"       moves={len(moves_df):,}  games={len(games_df):,}  possible={len(poss_df):,}")
-
-    # ---- Elo filter ----
-    if min_elo > 0 or max_elo > 0:
-        elo_mask = pd.Series(True, index=games_df.index)
-        if min_elo > 0:
-            elo_mask &= (games_df['white_elo'] >= min_elo) & (games_df['black_elo'] >= min_elo)
-        if max_elo > 0:
-            elo_mask &= (games_df['white_elo'] <= max_elo) & (games_df['black_elo'] <= max_elo)
-        valid_games = games_df[elo_mask].index
-        moves_df = moves_df[moves_df['game_id'].isin(valid_games)]
-        poss_df  = poss_df[poss_df['game_id'].isin(valid_games)]
-        filter_desc = []
-        if min_elo > 0:
-            filter_desc.append(f"Elo≥{min_elo}")
-        if max_elo > 0:
-            filter_desc.append(f"Elo≤{max_elo}")
-        print(f"       After {' & '.join(filter_desc)} filter: {len(moves_df):,} moves")
-
-    # ---- Index possible moves by (game_id, move_no) ----
-    print("[2/5] Indexing possible moves …")
-    poss_index: Dict[Tuple[str, int], List[Dict]] = defaultdict(list)
-    for _, row in poss_df.iterrows():
-        poss_index[(row['game_id'], row['move_no'])].append(row.to_dict())
-    print(f"       {len(poss_index):,} (game, move) keys")
-
-    # ---- Split by game_id ----
-    print("[3/5] Splitting by game_id …")
-    rng = np.random.RandomState(seed)
-    unique_games = moves_df['game_id'].unique()
-    rng.shuffle(unique_games)
-    n_val  = max(1, int(len(unique_games) * val_frac))
-    n_test = max(1, int(len(unique_games) * test_frac))
-    test_games = set(unique_games[:n_test])
-    val_games  = set(unique_games[n_test:n_test + n_val])
-    train_games = set(unique_games[n_test + n_val:])
-    print(f"       train={len(train_games)}  val={len(val_games)}  test={len(test_games)}")
-
-    # ---- Build compact examples per split ----
-    for split_name, split_gids in [('train', train_games), ('val', val_games), ('test', test_games)]:
-        split_moves = moves_df[moves_df['game_id'].isin(split_gids)]
-        print(f"\n[4/5] Building {split_name}: {len(split_moves):,} moves …")
-
+def process_moves_chunked(moves_df, games_dict, poss_index, max_possible, with_phase, workers, split_name):
+    """Process moves in chunks to avoid building giant task lists."""
+    CHUNK_SIZE = 100000  # Process 100K moves at a time
+    SHARD_SIZE = 500000  # Write shard after 500K examples
+    
+    all_examples = []
+    total_processed = 0
+    
+    for chunk_start in range(0, len(moves_df), CHUNK_SIZE):
+        chunk_end = min(chunk_start + CHUNK_SIZE, len(moves_df))
+        chunk_df = moves_df.iloc[chunk_start:chunk_end]
+        
         tasks = []
-        for _, mrow in split_moves.iterrows():
+        for _, mrow in chunk_df.iterrows():
             gid = mrow['game_id']
-            mno = mrow['move_no']
-            if gid not in games_df.index:
+            mno = int(mrow['move_no'])
+            if gid not in games_dict:
                 continue
             possibles = poss_index.get((gid, mno), [])
             if not possibles:
                 continue
-            tasks.append((mrow.to_dict(), games_df.loc[gid].to_dict(), possibles, max_possible))
-
-        results: List[Optional[Dict]] = []
-        if workers > 1:
+            tasks.append((mrow.to_dict(), games_dict[gid], possibles, max_possible, with_phase))
+        
+        if not tasks:
+            continue
+        
+        # Process chunk
+        results = []
+        if workers > 1 and tasks:
             with Pool(workers) as pool:
-                results = pool.map(build_one_compact, tasks, chunksize=64)
+                results = [r for r in pool.map(build_one_compact_wrapper, tasks, chunksize=64) if r is not None]
         else:
-            results = [build_one_compact(t) for t in tasks]
+            results = [build_one_compact(*t) for t in tasks]
+            results = [r for r in results if r is not None]
+        
+        all_examples.extend(results)
+        total_processed += len(chunk_df)
+        
+        print(f"\r  {split_name}: {len(moves_df):,} moves → {total_processed:,} processed", end='', flush=True)
+        
+        # If we have enough examples for a shard, yield them
+        if len(all_examples) >= SHARD_SIZE:
+            yield all_examples[:SHARD_SIZE]
+            all_examples = all_examples[SHARD_SIZE:]
+        
+        del tasks, results, chunk_df
+        gc.collect()
+    
+    # Yield remaining examples
+    if all_examples:
+        yield all_examples
 
-        examples = [r for r in results if r is not None]
-        print(f"       Built {len(examples):,} valid examples (dropped {len(tasks) - len(examples):,})")
 
-        if not examples:
-            print(f"       ⚠ Skipping {split_name} — no valid examples")
+# ---------------------------------------------------------------------------
+# Build dataset (per-worker, chunked)
+# ---------------------------------------------------------------------------
+
+def build_dataset(data_dir: str, output_dir: str, max_possible: int = 40,
+                  min_elo: int = 0, max_elo: int = 0, val_frac: float = 0.1,
+                  test_frac: float = 0.05, workers: int = 4, seed: int = 42,
+                  with_phase: bool = False):
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / 'train').mkdir(exist_ok=True)
+    (out / 'val').mkdir(exist_ok=True)
+    (out / 'test').mkdir(exist_ok=True)
+
+    root = Path(data_dir)
+    print(f"[DEBUG] Data dir: {root}, exists: {root.exists()}", flush=True)
+    
+    # Discover worker directories at any depth under root
+    worker_dirs = sorted(set(
+        f.parent.parent for f in root.rglob('games/*.parquet')
+    ))
+    if not worker_dirs:
+        print("ERROR: No worker directories found with games/*.parquet. Check data-dir path.", flush=True)
+        return
+    print(f"[1/4] Found {len(worker_dirs)} worker directories", flush=True)
+
+    all_game_ids = set()
+    for wdir in worker_dirs:
+        games_files = sorted((wdir / 'games').glob('*.parquet'))
+        for f in games_files:
+            try:
+                df = pq.read_table(str(f), columns=['game_id']).to_pandas()
+                all_game_ids.update(df['game_id'].astype(str).tolist())
+            except Exception as e:
+                print(f"  Warning: could not read {f}: {e}", flush=True)
+    all_game_ids = sorted(all_game_ids)
+    print(f"[2/4] Found {len(all_game_ids):,} unique games", flush=True)
+
+    if not all_game_ids:
+        print("ERROR: No games found! Check data-dir path.", flush=True)
+        return
+
+    rng = np.random.RandomState(seed)
+    rng.shuffle(all_game_ids)
+    n_val = max(1, int(len(all_game_ids) * val_frac))
+    n_test = max(1, int(len(all_game_ids) * test_frac))
+    test_games = set(all_game_ids[:n_test])
+    val_games = set(all_game_ids[n_test:n_test + n_val])
+    train_games = set(all_game_ids[n_test + n_val:])
+
+    split_counts = {'train': 0, 'val': 0, 'test': 0}
+    shard_counters = {'train': 0, 'val': 0, 'test': 0}
+
+    for widx, wdir in enumerate(worker_dirs):
+        print(f"\n[3/4] Processing worker {widx+1}/{len(worker_dirs)}: {wdir.name}", flush=True)
+        
+        moves_files = sorted((wdir / 'moves').glob('*.parquet'))
+        games_files = sorted((wdir / 'games').glob('*.parquet'))
+        poss_files = sorted((wdir / 'possible_moves').glob('*.parquet'))
+        
+        if not moves_files or not games_files or not poss_files:
+            print(f"  Skipping — missing files", flush=True)
             continue
 
-        # Stack compact arrays + string arrays
-        npz_path = out / f'{split_name}.npz'
-        np.savez_compressed(
-            npz_path,
-            # String data (object arrays)
-            fen_before         = np.array([e['fen_before'] for e in examples], dtype=object),
-            game_to_position   = np.array([e['game_to_position'] for e in examples], dtype=object),
-            possible_uci       = np.array([e['possible_uci'] for e in examples], dtype=object),
-            possible_fen_after = np.array([e['possible_fen_after'] for e in examples], dtype=object),
-            # Numeric data
-            possible_scalars   = np.stack([e['possible_scalars'] for e in examples]),
-            possible_mask      = np.stack([e['possible_mask'] for e in examples]),
-            tabular            = np.stack([e['tabular'] for e in examples]),
-            actual_idx         = np.array([e['actual_idx'] for e in examples]),
-            is_mistake         = np.array([e['is_mistake'] for e in examples]),
-            win_prob_before    = np.stack([e['win_prob_before'] for e in examples]),
-            win_prob_after     = np.stack([e['win_prob_after'] for e in examples]),
-            time_spent_log     = np.array([e['time_spent_log'] for e in examples]),
-            game_phase         = np.array([e['game_phase'] for e in examples]),
-        )
-        sz_mb = os.path.getsize(npz_path) / (1024 * 1024)
-        print(f"       Saved {npz_path}  ({sz_mb:.1f} MB)")
+        PARQUET_BATCH = 50
+        # Remove duplicate definition below
+        print(f"  Loading games...", flush=True)
+        try:
+            games_df = pd.concat([pq.read_table(str(f)).to_pandas() for f in games_files])
+            games_df = games_df.set_index('game_id')
+            if min_elo > 0 or max_elo > 0:
+                mask = pd.Series(True, index=games_df.index)
+                if min_elo > 0:
+                    mask &= (games_df['white_elo'] >= min_elo) & (games_df['black_elo'] >= min_elo)
+                if max_elo > 0:
+                    mask &= (games_df['white_elo'] <= max_elo) & (games_df['black_elo'] <= max_elo)
+                games_df = games_df[mask]
+            games_dict = {str(k): v.to_dict() for k, v in games_df.iterrows()}
+        except Exception as e:
+            print(f"  Error loading games: {e}", flush=True)
+            continue
 
-    # ---- Save config ----
+        print(f"  Loading moves ({len(moves_files)} files)...", flush=True)
+        moves_dfs = []
+        for i in range(0, len(moves_files), PARQUET_BATCH):
+            batch = moves_files[i:i + PARQUET_BATCH]
+            batch_df = pd.concat([pq.read_table(str(f)).to_pandas() for f in batch])
+            batch_df['game_id'] = batch_df['game_id'].astype(str)
+            batch_df = batch_df[batch_df['game_id'].isin(games_dict.keys())]
+            moves_dfs.append(batch_df)
+            del batch_df
+        moves_df = pd.concat(moves_dfs)
+        del moves_dfs
+        gc.collect()
+        print(f"  Loaded {len(moves_df):,} moves", flush=True)
+        
+        print(f"  Loading possible_moves ({len(poss_files)} files)...", flush=True)
+        poss_dfs = []
+        for i in range(0, len(poss_files), PARQUET_BATCH):
+            batch = poss_files[i:i + PARQUET_BATCH]
+            batch_df = pd.concat([pq.read_table(str(f)).to_pandas() for f in batch])
+            batch_df['game_id'] = batch_df['game_id'].astype(str)
+            batch_df = batch_df[batch_df['game_id'].isin(games_dict.keys())]
+            poss_dfs.append(batch_df)
+            print(f"    possible_moves batch {i // PARQUET_BATCH + 1}/"
+                  f"{math.ceil(len(poss_files) / PARQUET_BATCH)} "
+                  f"({len(batch_df):,} rows)", flush=True)
+            del batch_df
+        poss_df = pd.concat(poss_dfs)
+        del poss_dfs
+        gc.collect()
+        print(f"  Loaded {len(poss_df):,} possible moves", flush=True)
+        
+        # Build index using groupby (fast) instead of iterrows (catastrophically slow)
+        print(f"  Building possible_moves index...", flush=True)
+        poss_df['game_id'] = poss_df['game_id'].astype(str)
+        poss_df['move_no'] = poss_df['move_no'].astype(int)
+        poss_index = {}
+        for (gid, mno), group in poss_df.groupby(['game_id', 'move_no']):
+            poss_index[(str(gid), int(mno))] = group.to_dict('records')
+        print(f"  Indexed {len(poss_index):,} positions", flush=True)
+        
+        del poss_df
+        gc.collect()
+
+        # Split moves by game
+        print(f"  Splitting moves by game...", flush=True)
+        split_moves_dfs = {'train': [], 'val': [], 'test': []}
+        for gid, group in moves_df.groupby('game_id'):
+            if gid in train_games:
+                split_moves_dfs['train'].append(group)
+            elif gid in val_games:
+                split_moves_dfs['val'].append(group)
+            elif gid in test_games:
+                split_moves_dfs['test'].append(group)
+        
+        for split_name in ['train', 'val', 'test']:
+            dfs = split_moves_dfs[split_name]
+            if not dfs:
+                continue
+            split_moves_df = pd.concat(dfs)
+            print(f"  {split_name}: {len(split_moves_df):,} moves", end='', flush=True)
+            
+            # Process in chunks and write shards
+            for examples in process_moves_chunked(split_moves_df, games_dict, poss_index, max_possible, with_phase, workers, split_name):
+                if not examples:
+                    continue
+                
+                out_dir = out / split_name
+                shard_id = shard_counters[split_name]
+                shard_path = out_dir / f'shard_{shard_id:04d}.npz'
+                
+                save_dict = {
+                    'fen_before': np.array([e['fen_before'] for e in examples], dtype=object),
+                    'game_to_position': np.array([e['game_to_position'] for e in examples], dtype=object),
+                    'possible_uci': np.array([e['possible_uci'] for e in examples], dtype=object),
+                    'possible_fen_after': np.array([e['possible_fen_after'] for e in examples], dtype=object),
+                    'possible_scalars': np.stack([e['possible_scalars'] for e in examples]),
+                    'possible_mask': np.stack([e['possible_mask'] for e in examples]),
+                    'tabular': np.stack([e['tabular'] for e in examples]),
+                    'actual_idx': np.array([e['actual_idx'] for e in examples]),
+                    'is_mistake': np.array([e['is_mistake'] for e in examples]),
+                    'win_prob_before': np.stack([e['win_prob_before'] for e in examples]),
+                    'win_prob_after': np.stack([e['win_prob_after'] for e in examples]),
+                    'time_spent_log': np.array([e['time_spent_log'] for e in examples]),
+                }
+                if with_phase:
+                    save_dict['game_phase'] = np.array([e.get('game_phase', 0) for e in examples])
+                
+                np.savez_compressed(shard_path, **save_dict)
+                sz_mb = os.path.getsize(shard_path) / (1024 * 1024)
+                print(f" → {len(examples):,} examples, {sz_mb:.1f} MB → {shard_path.name}", flush=True)
+                
+                split_counts[split_name] += len(examples)
+                shard_counters[split_name] += 1
+                
+                del examples
+                gc.collect()
+        
+        del games_df, moves_df, poss_index, split_moves_dfs
+        gc.collect()
+
+    print(f"\n[4/4] Total examples: train={split_counts['train']:,}, val={split_counts['val']:,}, test={split_counts['test']:,}", flush=True)
+    
     config = {
-        'format': 'compact_v1',
+        'format': 'compact_sharded_v1',
         'max_possible': max_possible,
         'min_elo': min_elo,
         'max_elo': max_elo,
-        'tabular_dim': 18,
-        'move_scalar_dim': 11,
-        'planes_dim': '47x8x8 (built on-the-fly from FEN)',
-        'tabular_features': [
-            'time_remaining/3600', 'white_elo/3000', 'black_elo/3000',
-            'elo_diff/1000', 'move_no/200', 'color_01',
-            'eval_stm_before/1000', 'stm_win_before', 'draw_perc_before',
-            'stm_loss_before', 'initial_time/3600', 'increment/60',
-            'prev_move_was_capture', 'in_check',
-            'eval_std/1000', 'num_captures_frac', 'num_checks_frac',
-            'num_candidates_frac',
-        ],
-        'move_scalar_features': [
-            'eval_stm/1000', 'stm_win_perc', 'draw_perc', 'stm_loss_perc',
-            'log1p(nodes)/20', 'depth/40', 'move_quality',
-            'piece_type', 'is_capture', 'is_check', 'is_checkmate',
-        ],
-        'splits': {'val_frac': val_frac, 'test_frac': test_frac, 'seed': seed},
+        'with_phase': with_phase,
+        'val_frac': val_frac,
+        'test_frac': test_frac,
+        'seed': seed,
     }
     with open(out / 'dataset_config.json', 'w') as f:
         json.dump(config, f, indent=2)
-    print(f"\n[5/5] Saved dataset_config.json")
-    print("Done!")
+    print("Done!", flush=True)
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Build MIMO chess dataset (compact)')
-    parser.add_argument('--data-dir',     required=True,
-                        help='Root output dir (e.g. output/lc0/791556).')
-    parser.add_argument('--output-dir',   required=True, help='Output directory for .npz splits')
+    print("Starting mimo_dataset.py...", flush=True)
+    parser = argparse.ArgumentParser(description='Build MIMO chess dataset (compact, per-worker, chunked)')
+    parser.add_argument('--data-dir', required=True)
+    parser.add_argument('--output-dir', required=True)
     parser.add_argument('--max-possible', type=int, default=40)
-    parser.add_argument('--min-elo',      type=int, default=0)
-    parser.add_argument('--max-elo',      type=int, default=0)
-    parser.add_argument('--val-frac',     type=float, default=0.10)
-    parser.add_argument('--test-frac',    type=float, default=0.05)
-    parser.add_argument('--workers',      type=int, default=4)
-    parser.add_argument('--seed',         type=int, default=42)
+    parser.add_argument('--min-elo', type=int, default=0)
+    parser.add_argument('--max-elo', type=int, default=0)
+    parser.add_argument('--val-frac', type=float, default=0.10)
+    parser.add_argument('--test-frac', type=float, default=0.05)
+    parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--with-phase', action='store_true')
     args = parser.parse_args()
-
-    build_dataset(
-        args.data_dir, args.output_dir,
-        max_possible=args.max_possible,
-        min_elo=args.min_elo, max_elo=args.max_elo,
-        val_frac=args.val_frac, test_frac=args.test_frac,
-        workers=args.workers, seed=args.seed,
-    )
+    print(f"Args: data_dir={args.data_dir}, output_dir={args.output_dir}, workers={args.workers}", flush=True)
+    build_dataset(args.data_dir, args.output_dir, args.max_possible,
+                  args.min_elo, args.max_elo, args.val_frac, args.test_frac,
+                  args.workers, args.seed, args.with_phase)

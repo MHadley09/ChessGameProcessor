@@ -4,6 +4,21 @@ ParquetWriter — Writes game evaluation data to parquet files.
 Imports schemas from parquet_schema.py (the canonical source of truth).
 Dataclass fields match the schemas exactly (same names, same order).
 Each flush produces a NEW file — no overwrites.
+
+Supports automatic batch rotation: when the number of games in the current
+batch reaches max_games_per_batch, all buffers are flushed and a new batch
+subdirectory is created. Each batch contains its own games/, moves/, and
+possible_moves/ folders, keeping file sizes manageable for downstream
+dataset building.
+
+Output structure (with batching):
+    worker_00_20260516_120000_B0000/
+        games/part_000000.parquet
+        moves/part_000000.parquet
+        possible_moves/part_000000.parquet
+    worker_00_20260516_120000_B0001/
+        games/part_000000.parquet
+        ...
 """
 
 from dataclasses import dataclass, asdict
@@ -128,14 +143,23 @@ class ParquetWriter:
     Buffered parquet writer that flushes batches to sequentially-numbered
     part files. Each flush produces a NEW file — no overwrites.
 
-    Output structure:
-        output_dir/
-          games/
-            part_000000.parquet
-          moves/
-            part_000000.parquet
-          possible_moves/
-            part_000000.parquet
+    Supports automatic batch rotation: after max_games_per_batch games,
+    all buffers are flushed and writing rotates to a new batch subdirectory.
+
+    Output structure (with batching enabled):
+        {base_output_dir}_B0000/
+          games/part_000000.parquet
+          moves/part_000000.parquet
+          possible_moves/part_000000.parquet
+        {base_output_dir}_B0001/
+          games/part_000000.parquet
+          ...
+
+    Output structure (batching disabled, max_games_per_batch=0):
+        {base_output_dir}/
+          games/part_000000.parquet
+          moves/part_000000.parquet
+          possible_moves/part_000000.parquet
     """
 
     def __init__(
@@ -143,18 +167,30 @@ class ParquetWriter:
         output_dir: str,
         games_batch_size: int = 10_000,
         moves_batch_size: int = 10_000,
-        possible_moves_batch_size: int = 10_000,
+        possible_moves_batch_size: int = 100_000,
         worker_id: Optional[int] = None,
+        max_games_per_batch: int = 15_000,
     ):
-        self.output_dir = Path(output_dir)
+        self._base_output_dir = Path(output_dir)
         self._batch_sizes = {
             "games": games_batch_size,
             "moves": moves_batch_size,
             "possible_moves": possible_moves_batch_size,
         }
         self.worker_id = worker_id
+        self.max_games_per_batch = max_games_per_batch
 
-        # Separate counters per table type
+        # Batch rotation state
+        self._current_batch = 0
+        self._batch_games_count = 0
+
+        # Set up the actual output dir (with or without batch suffix)
+        if self.max_games_per_batch > 0:
+            self.output_dir = Path(f"{self._base_output_dir}_B{self._current_batch:04d}")
+        else:
+            self.output_dir = self._base_output_dir
+
+        # Separate counters per table type (reset per batch)
         self._file_counters = {"games": 0, "moves": 0, "possible_moves": 0}
 
         # Buffers
@@ -162,12 +198,12 @@ class ParquetWriter:
         self._move_buffer: List[dict] = []
         self._possible_move_buffer: List[dict] = []
 
-        # Totals
+        # Totals (cumulative across all batches)
         self.games_written = 0
         self.moves_written = 0
         self.possible_moves_written = 0
 
-        # Create dirs
+        # Create dirs for the first batch
         for sub in ("games", "moves", "possible_moves"):
             (self.output_dir / sub).mkdir(parents=True, exist_ok=True)
 
@@ -178,6 +214,11 @@ class ParquetWriter:
         if len(self._game_buffer) >= self._batch_sizes["games"]:
             self._flush_buffer("games", self._game_buffer, GAMES_SCHEMA)
             self._game_buffer = []
+
+        # Track games for batch rotation
+        self._batch_games_count += 1
+        if self.max_games_per_batch > 0 and self._batch_games_count >= self.max_games_per_batch:
+            self._rotate_batch()
 
     def write_move(self, record):
         self._move_buffer.append(_to_dict(record))
@@ -206,6 +247,22 @@ class ParquetWriter:
     def close(self):
         """Flush and finalize."""
         self.flush()
+
+    # ── Batch rotation ───────────────────────────────────────────────────
+
+    def _rotate_batch(self):
+        """Flush current batch, increment batch counter, create new dirs."""
+        self.flush()
+        self._current_batch += 1
+        self._batch_games_count = 0
+        self.output_dir = Path(f"{self._base_output_dir}_B{self._current_batch:04d}")
+
+        # Reset per-batch file counters
+        self._file_counters = {"games": 0, "moves": 0, "possible_moves": 0}
+
+        # Create dirs for the new batch
+        for sub in ("games", "moves", "possible_moves"):
+            (self.output_dir / sub).mkdir(parents=True, exist_ok=True)
 
     # ── Internal ─────────────────────────────────────────────────────────
 
