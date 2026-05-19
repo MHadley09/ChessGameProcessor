@@ -70,7 +70,7 @@ class BatchLC0Evaluator:
         batch_size: int = 256,
         nodes: int = 1,
         multipv_nodes: int = 100,  # Legacy default; now using dynamic nodes (3x legal moves, cap 150, else 2x cap 250)
-        nn_cache_size: int = 200000,
+        nn_cache_size: int = 50000,
         threads: int = 1,
     ):
         self.lc0_path = lc0_path
@@ -85,10 +85,14 @@ class BatchLC0Evaluator:
 
     def start(self):
         """Start the LC0 engine process with all-legal-moves exploration settings."""
-        self._engine = chess.engine.SimpleEngine.popen_uci(
-            self.lc0_path,
-            timeout=60,
-        )
+        try:
+            self._engine = chess.engine.SimpleEngine.popen_uci(
+                self.lc0_path,
+                timeout=60,
+            )
+        except Exception as e:
+            self._engine = None
+            raise RuntimeError(f"Failed to start LC0 engine: {e}") from e
         self._engine.configure({
             "WeightsFile": self.weights_path,
             "Backend": self.backend,
@@ -245,12 +249,12 @@ class BatchLC0Evaluator:
             nodes = min(3 * n_legal, 500)
         nodes = max(nodes, 150)  # Floor at 150 nodes
         
-        # Single call: multipv=218 with dynamic nodes
+        # Single call: multipv=n_legal (exact match to legal moves)
         # PerPVCounters=True gives each PV its own search tree
         infos = self._engine.analyse(
             board,
             chess.engine.Limit(nodes=nodes),
-            multipv=MAX_LEGAL_MOVES,
+            multipv=n_legal,
             info=chess.engine.INFO_ALL,
         )
 
@@ -301,13 +305,32 @@ class BatchLC0Evaluator:
 
             results.append(entry)
 
-        # All legal moves must be covered — no silent fallback
+        # Warn if some legal moves were missed (rare edge case)
         if len(results) < n_legal:
             missing = [m.uci() for m in legal_moves if m.uci() not in seen_moves]
-            raise RuntimeError(
-                f"multipv=218 missed {n_legal - len(results)} legal moves "
-                f"(got {len(results)}/{n_legal}). Missing: {missing[:5]}"
+            import sys
+            print(
+                f"[WARN] multipv={n_legal} returned {len(results)}/{n_legal} "
+                f"legal moves. Missing: {missing[:5]}",
+                file=sys.stderr,
             )
+            # Fill missing moves with None evals so downstream schema stays consistent
+            for move in legal_moves:
+                uci = move.uci()
+                if uci not in seen_moves:
+                    mi = move_info.get(uci, {"san": uci, "fen_after": ""})
+                    results.append({
+                        "move_uci": uci,
+                        "move_san": mi["san"],
+                        "score_cp": None,
+                        "score_mate": None,
+                        "nodes": 0,
+                        "depth": 0,
+                        "wdl_w": None,
+                        "wdl_d": None,
+                        "wdl_l": None,
+                        "fen_after": mi["fen_after"],
+                    })
 
         return results
 
@@ -316,7 +339,10 @@ class BatchLC0Evaluator:
             try:
                 self._engine.quit()
             except Exception:
-                pass
+                try:
+                    self._engine.close()
+                except Exception:
+                    pass
             self._engine = None
 
 

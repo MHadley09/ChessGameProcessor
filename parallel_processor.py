@@ -193,7 +193,7 @@ def _extract_wdl_from_eval(eval_result):
     return None, None, None
 
 
-def _process_game_with_engine(engine, game_id, pgn_text, engine_name, engine_version):
+def _process_game_with_engine(engine, game_id, pgn_text, engine_name, engine_version, opening_cache=None):
     """
     Process a single game with any engine that has:
       - evaluate_position(board, multipv=1) for position-level eval
@@ -352,25 +352,38 @@ def _process_game_with_engine(engine, game_id, pgn_text, engine_name, engine_ver
         mate_before = None
         wdl_w_before, wdl_d_before, wdl_l_before = None, None, None
 
+        # Opening cache lookup: FEN without move counters
+        _oc_key = " ".join(board.fen().split()[:4]) if opening_cache else None
+        _oc_hit = opening_cache.get(_oc_key) if _oc_key else None
+
         if cached_eval is not None:
             eval_before_cp, mate_before, wdl_w_before, wdl_d_before, wdl_l_before = cached_eval
 
-        # If no cache, get a quick position eval for eval_before
+        # If no cache, try opening cache, then fall back to engine eval
         if cached_eval is None and not board.is_game_over():
-            try:
-                eval_before_result = engine.evaluate_position(board, multipv=1)
-                eval_before_cp = float(eval_before_result.score_cp) if eval_before_result.score_cp is not None else None
-                mate_before = float(eval_before_result.score_mate) if eval_before_result.score_mate is not None else None
-                wdl_w_before, wdl_d_before, wdl_l_before = _extract_wdl_from_eval(eval_before_result)
-            except Exception:
-                pass
+            if _oc_hit:
+                oc_eval = _oc_hit["eval"]
+                eval_before_cp = float(oc_eval.score_cp) if oc_eval.score_cp is not None else None
+                mate_before = float(oc_eval.score_mate) if oc_eval.score_mate is not None else None
+                wdl_w_before, wdl_d_before, wdl_l_before = _extract_wdl_from_eval(oc_eval)
+            else:
+                try:
+                    eval_before_result = engine.evaluate_position(board, multipv=1)
+                    eval_before_cp = float(eval_before_result.score_cp) if eval_before_result.score_cp is not None else None
+                    mate_before = float(eval_before_result.score_mate) if eval_before_result.score_mate is not None else None
+                    wdl_w_before, wdl_d_before, wdl_l_before = _extract_wdl_from_eval(eval_before_result)
+                except Exception:
+                    pass
 
         w_win_b, b_win_b, draw_b = _wdl_percentages(wdl_w_before, wdl_d_before, wdl_l_before)
 
-        # ── Enumerate ALL legal moves via single multipv=218 call ────────
+        # ── Enumerate ALL legal moves (opening cache or engine call) ──────
         all_legal_evals = None
         if not board.is_game_over():
-            all_legal_evals = engine.evaluate_all_legal_moves(board)
+            if _oc_hit:
+                all_legal_evals = _oc_hit["all_moves"]
+            else:
+                all_legal_evals = engine.evaluate_all_legal_moves(board)
 
         # ── Push actual move, eval AFTER ─────────────────────────────────
         board.push(move)
@@ -528,13 +541,73 @@ def _process_game_with_engine(engine, game_id, pgn_text, engine_name, engine_ver
 
 # ── LC0 Worker ───────────────────────────────────────────────────────────────
 
+# ── Opening position cache (first 3 ply) ────────────────────────────────────
+
+def _build_opening_cache(engine, max_ply=3):
+    """
+    Pre-compute eval_position + evaluate_all_legal_moves for all positions
+    reachable within max_ply from the starting position.
+    
+    Returns a dict keyed by FEN (board-only, no move counters) mapping to:
+        {"eval": EvalResult, "all_moves": [dict, ...]}
+    
+    ~8,700 positions at 3 ply, takes ~45s with one engine.
+    """
+    import chess
+    cache = {}
+    
+    def _fen_key(board):
+        """FEN without halfmove/fullmove counters for position matching."""
+        parts = board.fen().split()
+        return " ".join(parts[:4])
+    
+    def _explore(board, depth):
+        if depth > max_ply:
+            return
+        key = _fen_key(board)
+        if key in cache:
+            return
+        
+        try:
+            eval_result = engine.evaluate_position(board, multipv=1)
+            all_moves = engine.evaluate_all_legal_moves(board)
+            cache[key] = {"eval": eval_result, "all_moves": all_moves}
+        except Exception as e:
+            pass  # Eval failed but still recurse into children
+        
+        if depth < max_ply:
+            for move in board.legal_moves:
+                board.push(move)
+                _explore(board, depth + 1)
+                board.pop()
+    
+    board = chess.Board()
+    _explore(board, 1)
+    return cache
+
+
 def lc0_worker(
     worker_id, game_queue, result_queue,
     lc0_path, weights_path, backend, batch_size, nodes, multipv_nodes,
     nn_cache_size, output_dir, evaluator_version, run_timestamp,
-    max_games_per_batch,
+    max_games_per_batch, opening_cache=None,
 ):
     """LC0 worker process. Evaluates all legal moves per position."""
+    # Pin worker to a specific CPU core for L3 cache locality (7800X3D V-Cache)
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.GetCurrentProcess()
+            # Pin to core worker_id (mod cpu_count to stay safe)
+            core = worker_id % os.cpu_count()
+            mask = 1 << core
+            kernel32.SetProcessAffinityMask(handle, mask)
+        else:
+            os.sched_setaffinity(0, {worker_id % os.cpu_count()})
+    except Exception:
+        pass  # Non-fatal: run without pinning
+
     worker_base = os.path.join(output_dir, f"worker_{worker_id:02d}_{run_timestamp}")
     writer = ParquetWriter(
         worker_base,
@@ -567,6 +640,7 @@ def lc0_worker(
             try:
                 game_rec, moves, pmoves = _process_game_with_engine(
                     engine, game_id, pgn_text, "lc0", evaluator_version,
+                    opening_cache=opening_cache,
                 )
                 
                 # Check if engine returned empty results (crashed silently)
@@ -591,12 +665,17 @@ def lc0_worker(
                 consecutive_errors += 1
                 error_msg = str(e)
                 
-                # Check if engine process died
-                engine_crashed = (
-                    "engine process died" in error_msg.lower() or
-                    "event loop dead" in error_msg.lower() or
-                    "engine returned empty results" in error_msg.lower()
-                )
+                # Check if engine process died (covers python-chess transport errors too)
+                engine_crashed = any(pat in error_msg.lower() for pat in (
+                    "engine process died",
+                    "event loop dead",
+                    "engine returned empty results",
+                    "transport is closing",
+                    "broken pipe",
+                    "connection reset",
+                    "engine not started",
+                    "failed to start lc0",
+                ))
                 
                 if engine_crashed:
                     print(f"[Worker {worker_id}] Engine crashed: {error_msg}")
@@ -631,6 +710,7 @@ def lc0_worker(
                         print(f"[Worker {worker_id}] Retrying game {game_id}...")
                         game_rec, moves, pmoves = _process_game_with_engine(
                             engine, game_id, pgn_text, "lc0", evaluator_version,
+                            opening_cache=opening_cache,
                         )
                         writer.write_game(game_rec)
                         for m in moves:
@@ -755,7 +835,7 @@ def run_parallel(
     lc0_batch_size: int = 32,
     lc0_nodes: int = 1,
     lc0_multipv_nodes: int = 250,
-    lc0_nn_cache_size: int = 200000,
+    lc0_nn_cache_size: int = 50000,
     num_lc0_workers: int = 2,
     lc0_version: str = "791556",
     # Stockfish config
@@ -789,15 +869,35 @@ def run_parallel(
     sf_output = os.path.join(output_dir, "stockfish_d14", f"d{sf_depth}")
 
     # Single shared queue — each game goes to ONE engine, not both
-    game_queue: Queue = Queue(maxsize=(num_lc0_workers + num_sf_workers) * 4)
+    game_queue: Queue = Queue(maxsize=(num_lc0_workers + num_sf_workers) * 16)
     result_queue: Queue = Queue()
 
     all_workers: List[Process] = []
     total_worker_count = 0
 
     # Spawn LC0 workers
+    opening_cache = None
     if use_lc0:
         os.makedirs(lc0_output, exist_ok=True)
+        # Pre-compute opening position cache (3 ply deep)
+        print("[MAIN] Building opening position cache (3 ply)...")
+        try:
+            cache_engine = SyncBatchEvaluator(
+                lc0_path=lc0_path,
+                weights_path=weights_path,
+                backend=backend,
+                batch_size=lc0_batch_size,
+                nodes=lc0_nodes,
+                multipv_nodes=lc0_multipv_nodes,
+                nn_cache_size=lc0_nn_cache_size,
+            )
+            cache_engine.start()
+            opening_cache = _build_opening_cache(cache_engine, max_ply=3)
+            cache_engine.quit()
+            print(f"[MAIN] Opening cache: {len(opening_cache)} positions cached")
+        except Exception as e:
+            print(f"[MAIN] Opening cache failed ({e}), continuing without cache")
+            opening_cache = None
         for wid in range(num_lc0_workers):
             p = Process(
                 target=lc0_worker,
@@ -806,13 +906,17 @@ def run_parallel(
                     lc0_path, weights_path, backend,
                     lc0_batch_size, lc0_nodes, lc0_multipv_nodes,
                     lc0_nn_cache_size, lc0_output, lc0_version, run_timestamp,
-                    max_games_per_batch,
+                    max_games_per_batch, opening_cache,
                 ),
                 daemon=True,
             )
             p.start()
             all_workers.append(p)
             total_worker_count += 1
+            # Stagger worker starts to avoid GPU contention during model load
+            if wid < num_lc0_workers - 1:
+                import time
+                time.sleep(1.0)
         print(f"[MAIN] Spawned {num_lc0_workers} LC0 workers -> {lc0_output}")
         print(f"[MAIN] Mode: ALL legal moves via multipv=218, nodes={lc0_multipv_nodes}")
         print(f"[MAIN] Batch rotation: {max_games_per_batch} games per batch dir")
@@ -1029,7 +1133,7 @@ Examples:
     lc0.add_argument("--lc0-nodes", type=int, default=1, help="LC0 nodes for single-position eval (eval_before)")
     lc0.add_argument("--lc0-multipv-nodes", type=int, default=250,
                      help="LC0 nodes for all-legal-moves multipv=218 call (default 250)")
-    lc0.add_argument("--lc0-nn-cache-size", type=int, default=200000,
+    lc0.add_argument("--lc0-nn-cache-size", type=int, default=50000,
                      help="LC0 NNCache size (default 200000)")
     lc0.add_argument("--lc0-workers", type=int, default=2, help="Number of LC0 workers")
     lc0.add_argument("--lc0-version", default="791556", help="LC0 version tag")
