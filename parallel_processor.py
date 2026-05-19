@@ -22,14 +22,20 @@ from a shared queue. Dedup tracks (game_hash, engine) so restarts skip
 already-processed games regardless of which engine handled them.
 
 For each position, ALL legal moves are evaluated in a SINGLE engine call
-using multipv=218 with PerPVCounters=True. Each PV gets its own independent
-search tree, giving per-candidate eval + WDL without multiple round-trips.
+using dynamic multipv=n_legal with PerPVCounters=True. Each PV gets its own
+independent search tree, giving per-candidate eval + WDL without multiple
+round-trips. Node budget scales dynamically: 5×n_legal (cap 300), else
+3×n_legal (cap 500), floor 150.
+
+Each worker maintains a lazy position cache: positions at ply ≤ 4 are always
+cached on first encounter, plus the first 1,200 unique positions at ply 5.
+Cache hits skip both eval_before and evaluate_all_legal_moves calls entirely.
 
 Speed notes:
-  - One analyse(nodes=250, multipv=218) call per position with PerPVCounters=True.
+  - One analyse(nodes=dynamic, multipv=n_legal) call per position.
   - LC0 batches all NN evals internally on the GPU in one forward pass.
-  - Estimated throughput: ~3-8 games/sec total with 4 workers on RTX 4090.
-  - 500K games ≈ 1-2 days.
+  - Estimated throughput: ~5+ games/sec with 8 workers on RTX 4090.
+  - 500K games ≈ ~28 hours.
 """
 
 import os
@@ -46,6 +52,7 @@ import multiprocessing as mp
 from multiprocessing import Process, Queue
 from pathlib import Path
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Optional, List
 
 import chess
@@ -193,7 +200,7 @@ def _extract_wdl_from_eval(eval_result):
     return None, None, None
 
 
-def _process_game_with_engine(engine, game_id, pgn_text, engine_name, engine_version, opening_cache=None):
+def _process_game_with_engine(engine, game_id, pgn_text, engine_name, engine_version, position_cache=None, cache_max_ply=4, cache_depth_5_limit=1200, cache_stats=None):
     """
     Process a single game with any engine that has:
       - evaluate_position(board, multipv=1) for position-level eval
@@ -201,18 +208,23 @@ def _process_game_with_engine(engine, game_id, pgn_text, engine_name, engine_ver
 
     Returns (game_dict, [move_dict], [possible_move_dict]) matching parquet_schema.py.
 
-    For each position, ALL legal moves are evaluated in a SINGLE
-    engine.analyse(nodes=250, multipv=218) call with PerPVCounters=True.
-    Each PV gets its own search tree, producing ~30 possible_move rows
-    per actual move with genuine per-move WDL.
+    For each position, ALL legal moves are evaluated in a SINGLE engine call
+    using dynamic multipv=n_legal with PerPVCounters=True. Node budget scales
+    dynamically with position complexity.
+
+    Position cache (lazy, per-worker):
+    - Ply ≤ cache_max_ply: always cached on first encounter
+    - Ply == cache_max_ply + 1: first cache_depth_5_limit unique positions cached
+    - Cache hits skip eval_before + evaluate_all_legal_moves entirely
 
     Features:
     - SHA-256 hashed player names
     - Computed winner/loser/elo diffs
     - Full move detail (from_square, to_square, piece, promotion, color)
     - WDL before/after for actual moves
-    - Per-legal-move eval + WDL via single multipv=218 call in evaluate_all_legal_moves()
+    - Per-legal-move eval + WDL via single dynamic multipv call
     - Eval caching: eval_after[N] becomes eval_before[N+1] (zero extra calls)
+    - Lazy position cache for opening positions (ply ≤ 5)
     - time_spent computed from clock comment deltas
     - game_to_position as running SAN move list
     - static_eval_before/after set to None (no extra engine calls)
@@ -254,13 +266,6 @@ def _process_game_with_engine(engine, game_id, pgn_text, engine_name, engine_ver
     game_hash = compute_game_hash(pgn_text)
     evaluated_at = str(time.time())
 
-    # Count plies
-    ply_count = 0
-    tmp_node = game
-    while tmp_node.variations:
-        tmp_node = tmp_node.variation(0)
-        ply_count += 1
-
     game_rec = {
         "game_id": game_id,
         "game_order": None,
@@ -288,7 +293,7 @@ def _process_game_with_engine(engine, game_id, pgn_text, engine_name, engine_ver
         "utc_date": headers.get("UTCDate"),
         "utc_time": headers.get("UTCTime"),
         "variant": headers.get("Variant"),
-        "ply_count": ply_count,
+        "ply_count": 0,  # Updated at end of move loop
         "game_hash": game_hash,
         "evaluated_by": engine_name,
         "evaluator_version": engine_version,
@@ -352,17 +357,30 @@ def _process_game_with_engine(engine, game_id, pgn_text, engine_name, engine_ver
         mate_before = None
         wdl_w_before, wdl_d_before, wdl_l_before = None, None, None
 
-        # Opening cache lookup: FEN without move counters
-        _oc_key = " ".join(board.fen().split()[:4]) if opening_cache else None
-        _oc_hit = opening_cache.get(_oc_key) if _oc_key else None
+        # Lazy position cache lookup (ply <= 5)
+        _pc_key = " ".join(fen_before.split()[:4]) if position_cache is not None else None
+        _pc_hit = position_cache.get(_pc_key) if _pc_key else None
+        if _pc_hit and cache_stats is not None:
+            cache_stats['hits'] = cache_stats.get('hits', 0) + 1
+            if cache_stats['hits'] % 1000 == 0:
+                print(f"[CACHE] Hits: {cache_stats['hits']:,}", flush=True)
+        _should_cache = (
+            position_cache is not None
+            and _pc_hit is None
+            and (
+                move_no <= cache_max_ply
+                or (move_no == cache_max_ply + 1
+                    and position_cache.get("__depth5_count", 0) < cache_depth_5_limit)
+            )
+        )
 
         if cached_eval is not None:
             eval_before_cp, mate_before, wdl_w_before, wdl_d_before, wdl_l_before = cached_eval
 
-        # If no cache, try opening cache, then fall back to engine eval
+        # If no cached eval_after from previous move, try position cache, then engine
         if cached_eval is None and not board.is_game_over():
-            if _oc_hit:
-                oc_eval = _oc_hit["eval"]
+            if _pc_hit:
+                oc_eval = _pc_hit["eval"]
                 eval_before_cp = float(oc_eval.score_cp) if oc_eval.score_cp is not None else None
                 mate_before = float(oc_eval.score_mate) if oc_eval.score_mate is not None else None
                 wdl_w_before, wdl_d_before, wdl_l_before = _extract_wdl_from_eval(oc_eval)
@@ -377,13 +395,62 @@ def _process_game_with_engine(engine, game_id, pgn_text, engine_name, engine_ver
 
         w_win_b, b_win_b, draw_b = _wdl_percentages(wdl_w_before, wdl_d_before, wdl_l_before)
 
-        # ── Enumerate ALL legal moves (opening cache or engine call) ──────
+        # ── Enumerate ALL legal moves (position cache or engine call) ─────
         all_legal_evals = None
         if not board.is_game_over():
-            if _oc_hit:
-                all_legal_evals = _oc_hit["all_moves"]
+            if _pc_hit:
+                all_legal_evals = _pc_hit["all_moves"]
             else:
                 all_legal_evals = engine.evaluate_all_legal_moves(board)
+                # Cache this position if eligible
+                if _should_cache and _pc_key and all_legal_evals is not None:
+                    if cache_stats is not None:
+                        cache_stats['stores'] = cache_stats.get('stores', 0) + 1
+                        if cache_stats['stores'] % 1000 == 0:
+                            print(f"[CACHE] Stores: {cache_stats['stores']:,}", flush=True)
+                    _cache_eval = SimpleNamespace(
+                        score_cp=eval_before_cp,
+                        score_mate=mate_before,
+                        wdl_w=wdl_w_before,
+                        wdl_d=wdl_d_before,
+                        wdl_l=wdl_l_before,
+                    )
+                    position_cache[_pc_key] = {
+                        "eval": _cache_eval,
+                        "all_moves": all_legal_evals,
+                    }
+                    if move_no == cache_max_ply + 1:
+                        position_cache["__depth5_count"] = position_cache.get("__depth5_count", 0) + 1
+
+        # ── Pre-decompose possible moves (before push, using live board) ──
+        _pm_decomposed = []
+        _pm_by_uci = {e.get("move_uci"): e for e in all_legal_evals} if all_legal_evals else {}
+        if all_legal_evals:
+            for entry in all_legal_evals:
+                pm_uci = entry.get("move_uci", "")
+                pm_san = entry.get("move_san", "")
+                pm_fen_after = entry.get("fen_after", "")
+                pm_from, pm_to, pm_piece_str, pm_promo = "", "", "", ""
+                try:
+                    pm_move = chess.Move.from_uci(pm_uci)
+                    pm_from = chess.square_name(pm_move.from_square)
+                    pm_to = chess.square_name(pm_move.to_square)
+                    pm_piece = board.piece_at(pm_move.from_square)
+                    pm_piece_str = pm_piece.symbol() if pm_piece else ""
+                    pm_promo = chess.piece_name(pm_move.promotion) if pm_move.promotion else ""
+                except Exception:
+                    pass
+                pm_score_cp = float(entry["score_cp"]) if entry.get("score_cp") is not None else None
+                pm_score_mate = float(entry["score_mate"]) if entry.get("score_mate") is not None else None
+                pm_w, pm_b, pm_d = _wdl_percentages(
+                    entry.get("wdl_w"), entry.get("wdl_d"), entry.get("wdl_l"),
+                )
+                _pm_decomposed.append((
+                    pm_uci, pm_san, pm_fen_after,
+                    pm_from, pm_to, pm_piece_str, pm_promo,
+                    pm_score_cp, pm_score_mate, pm_w, pm_b, pm_d,
+                    entry.get("nodes", 0) or 0, entry.get("depth", 0) or 0,
+                ))
 
         # ── Push actual move, eval AFTER ─────────────────────────────────
         board.push(move)
@@ -415,17 +482,15 @@ def _process_game_with_engine(engine, game_id, pgn_text, engine_name, engine_ver
             # legal-moves enumeration — reuse it instead of another call)
             reused = False
             if all_legal_evals:
-                for entry in all_legal_evals:
-                    if entry.get("move_uci") == move.uci():
-                        # This is the child position for the actual move played.
-                        # Its eval is from WHITE's perspective — exactly what we want.
-                        eval_after_cp = float(entry["score_cp"]) if entry.get("score_cp") is not None else None
-                        mate_after = float(entry["score_mate"]) if entry.get("score_mate") is not None else None
-                        wdl_w_after = entry.get("wdl_w")
-                        wdl_d_after = entry.get("wdl_d")
-                        wdl_l_after = entry.get("wdl_l")
-                        reused = True
-                        break
+                # Dict lookup instead of linear scan (~30 entries per position)
+                _played = _pm_by_uci.get(move.uci())
+                if _played:
+                    eval_after_cp = float(_played["score_cp"]) if _played.get("score_cp") is not None else None
+                    mate_after = float(_played["score_mate"]) if _played.get("score_mate") is not None else None
+                    wdl_w_after = _played.get("wdl_w")
+                    wdl_d_after = _played.get("wdl_d")
+                    wdl_l_after = _played.get("wdl_l")
+                    reused = True
 
             if not reused:
                 try:
@@ -475,62 +540,36 @@ def _process_game_with_engine(engine, game_id, pgn_text, engine_name, engine_ver
         }
         move_records.append(mr)
 
-        # ── PossibleMoveRecords from ALL legal moves ─────────────────────
-        if all_legal_evals:
-            board_before = chess.Board(fen_before)
-
-            for entry in all_legal_evals:
-                pm_uci = entry.get("move_uci", "")
-                pm_san = entry.get("move_san", "")
-                pm_fen_after = entry.get("fen_after", "")
-
-                # Decompose the possible move
-                pm_from, pm_to, pm_piece_str, pm_promo = "", "", "", ""
-                try:
-                    pm_move = chess.Move.from_uci(pm_uci)
-                    pm_from = chess.square_name(pm_move.from_square)
-                    pm_to = chess.square_name(pm_move.to_square)
-                    pm_piece = board_before.piece_at(pm_move.from_square)
-                    pm_piece_str = pm_piece.symbol() if pm_piece else ""
-                    pm_promo = chess.piece_name(pm_move.promotion) if pm_move.promotion else ""
-                except Exception:
-                    pass
-
-                pm_score_cp = float(entry["score_cp"]) if entry.get("score_cp") is not None else None
-                pm_score_mate = float(entry["score_mate"]) if entry.get("score_mate") is not None else None
-
-                # WDL percentages (engine returns 0.0-1.0 from WHITE's perspective)
-                pm_w, pm_b, pm_d = _wdl_percentages(
-                    entry.get("wdl_w"),
-                    entry.get("wdl_d"),
-                    entry.get("wdl_l"),
-                )
-
-                pm = {
-                    "game_id": game_id,
-                    "move_no": move_no,
-                    "move_no_pair": move_no_pair,
-                    "notation": pm_san,
-                    "move": pm_uci,
-                    "from_square": pm_from,
-                    "to_square": pm_to,
-                    "piece": pm_piece_str,
-                    "promotion": pm_promo,
-                    "color": color,
-                    "fen_before": fen_before,
-                    "fen_after": pm_fen_after,
-                    "eval": pm_score_cp,
-                    "mate_count": pm_score_mate,
-                    "white_win_perc": pm_w,
-                    "black_win_perc": pm_b,
-                    "draw_perc": pm_d,
-                    "nodes": entry.get("nodes", 0) or 0,
-                    "depth": entry.get("depth", 0) or 0,
-                    "pv": "",
-                    "evaluated_by": engine_name,
-                    "evaluator_version": engine_version,
-                }
-                possible_move_records.append(pm)
+        # ── PossibleMoveRecords from pre-decomposed data ──────────────────
+        for (pm_uci, pm_san, pm_fen_after,
+             pm_from, pm_to, pm_piece_str, pm_promo,
+             pm_score_cp, pm_score_mate, pm_w, pm_b, pm_d,
+             pm_nodes, pm_depth) in _pm_decomposed:
+            pm = {
+                "game_id": game_id,
+                "move_no": move_no,
+                "move_no_pair": move_no_pair,
+                "notation": pm_san,
+                "move": pm_uci,
+                "from_square": pm_from,
+                "to_square": pm_to,
+                "piece": pm_piece_str,
+                "promotion": pm_promo,
+                "color": color,
+                "fen_before": fen_before,
+                "fen_after": pm_fen_after,
+                "eval": pm_score_cp,
+                "mate_count": pm_score_mate,
+                "white_win_perc": pm_w,
+                "black_win_perc": pm_b,
+                "draw_perc": pm_d,
+                "nodes": pm_nodes,
+                "depth": pm_depth,
+                "pv": "",
+                "evaluated_by": engine_name,
+                "evaluator_version": engine_version,
+            }
+            possible_move_records.append(pm)
 
         node = next_node
         ply += 1
@@ -541,58 +580,22 @@ def _process_game_with_engine(engine, game_id, pgn_text, engine_name, engine_ver
 
 # ── LC0 Worker ───────────────────────────────────────────────────────────────
 
-# ── Opening position cache (first 3 ply) ────────────────────────────────────
-
-def _build_opening_cache(engine, max_ply=3):
-    """
-    Pre-compute eval_position + evaluate_all_legal_moves for all positions
-    reachable within max_ply from the starting position.
-    
-    Returns a dict keyed by FEN (board-only, no move counters) mapping to:
-        {"eval": EvalResult, "all_moves": [dict, ...]}
-    
-    ~8,700 positions at 3 ply, takes ~45s with one engine.
-    """
-    import chess
-    cache = {}
-    
-    def _fen_key(board):
-        """FEN without halfmove/fullmove counters for position matching."""
-        parts = board.fen().split()
-        return " ".join(parts[:4])
-    
-    def _explore(board, depth):
-        if depth > max_ply:
-            return
-        key = _fen_key(board)
-        if key in cache:
-            return
-        
-        try:
-            eval_result = engine.evaluate_position(board, multipv=1)
-            all_moves = engine.evaluate_all_legal_moves(board)
-            cache[key] = {"eval": eval_result, "all_moves": all_moves}
-        except Exception as e:
-            pass  # Eval failed but still recurse into children
-        
-        if depth < max_ply:
-            for move in board.legal_moves:
-                board.push(move)
-                _explore(board, depth + 1)
-                board.pop()
-    
-    board = chess.Board()
-    _explore(board, 1)
-    return cache
-
-
 def lc0_worker(
     worker_id, game_queue, result_queue,
     lc0_path, weights_path, backend, batch_size, nodes, multipv_nodes,
     nn_cache_size, output_dir, evaluator_version, run_timestamp,
-    max_games_per_batch, opening_cache=None,
+    max_games_per_batch,
 ):
-    """LC0 worker process. Evaluates all legal moves per position."""
+    """LC0 worker process. Evaluates all legal moves per position.
+
+    Each worker maintains its own lazy position cache that builds organically
+    during game processing. Positions at ply ≤ 4 are always cached; the first
+    1,200 unique ply-5 positions are also cached. Cache hits skip both
+    eval_before and evaluate_all_legal_moves engine calls.
+
+    CPU affinity is pinned per worker for 7800X3D V-Cache locality.
+    Auto-restarts engine on crash (3 consecutive errors = worker death).
+    """
     # Pin worker to a specific CPU core for L3 cache locality (7800X3D V-Cache)
     try:
         if sys.platform == "win32":
@@ -627,9 +630,19 @@ def lc0_worker(
     )
     engine.start()
 
+    # Lazy position cache: populated during processing, shared across games in this worker
+    # Caches eval + all_legal_moves for positions at ply <= 4 (always) and
+    # first 1200 unique positions at ply 5. Keyed by FEN (board-only, no move counters).
+    position_cache = {}
+    CACHE_MAX_PLY = 4
+    CACHE_DEPTH_5_LIMIT = 1200
+    cache_hits = 0
+    cache_stores = 0
+
     games_done = 0
     consecutive_errors = 0
     max_consecutive_errors = 3
+    cache_stats = {'hits': 0, 'stores': 0}
     
     try:
         while True:
@@ -640,7 +653,10 @@ def lc0_worker(
             try:
                 game_rec, moves, pmoves = _process_game_with_engine(
                     engine, game_id, pgn_text, "lc0", evaluator_version,
-                    opening_cache=opening_cache,
+                    position_cache=position_cache,
+                    cache_max_ply=CACHE_MAX_PLY,
+                    cache_depth_5_limit=CACHE_DEPTH_5_LIMIT,
+                    cache_stats=cache_stats,
                 )
                 
                 # Check if engine returned empty results (crashed silently)
@@ -688,7 +704,6 @@ def lc0_worker(
                         pass
                     
                     # Pause before restart
-                    import time
                     time.sleep(2.0)
                     
                     # Restart engine
@@ -710,7 +725,9 @@ def lc0_worker(
                         print(f"[Worker {worker_id}] Retrying game {game_id}...")
                         game_rec, moves, pmoves = _process_game_with_engine(
                             engine, game_id, pgn_text, "lc0", evaluator_version,
-                            opening_cache=opening_cache,
+                            position_cache=position_cache,
+                            cache_max_ply=CACHE_MAX_PLY,
+                            cache_depth_5_limit=CACHE_DEPTH_5_LIMIT,
                         )
                         writer.write_game(game_rec)
                         for m in moves:
@@ -876,28 +893,8 @@ def run_parallel(
     total_worker_count = 0
 
     # Spawn LC0 workers
-    opening_cache = None
     if use_lc0:
         os.makedirs(lc0_output, exist_ok=True)
-        # Pre-compute opening position cache (3 ply deep)
-        print("[MAIN] Building opening position cache (3 ply)...")
-        try:
-            cache_engine = SyncBatchEvaluator(
-                lc0_path=lc0_path,
-                weights_path=weights_path,
-                backend=backend,
-                batch_size=lc0_batch_size,
-                nodes=lc0_nodes,
-                multipv_nodes=lc0_multipv_nodes,
-                nn_cache_size=lc0_nn_cache_size,
-            )
-            cache_engine.start()
-            opening_cache = _build_opening_cache(cache_engine, max_ply=3)
-            cache_engine.quit()
-            print(f"[MAIN] Opening cache: {len(opening_cache)} positions cached")
-        except Exception as e:
-            print(f"[MAIN] Opening cache failed ({e}), continuing without cache")
-            opening_cache = None
         for wid in range(num_lc0_workers):
             p = Process(
                 target=lc0_worker,
@@ -906,7 +903,7 @@ def run_parallel(
                     lc0_path, weights_path, backend,
                     lc0_batch_size, lc0_nodes, lc0_multipv_nodes,
                     lc0_nn_cache_size, lc0_output, lc0_version, run_timestamp,
-                    max_games_per_batch, opening_cache,
+                    max_games_per_batch,
                 ),
                 daemon=True,
             )
@@ -918,7 +915,7 @@ def run_parallel(
                 import time
                 time.sleep(1.0)
         print(f"[MAIN] Spawned {num_lc0_workers} LC0 workers -> {lc0_output}")
-        print(f"[MAIN] Mode: ALL legal moves via multipv=218, nodes={lc0_multipv_nodes}")
+        print(f"[MAIN] Mode: ALL legal moves via dynamic multipv, dynamic nodes (floor {lc0_multipv_nodes})")
         print(f"[MAIN] Batch rotation: {max_games_per_batch} games per batch dir")
 
     # Spawn Stockfish workers
@@ -1132,7 +1129,7 @@ Examples:
                      help="LC0 minibatch size (higher = better GPU utilization with all-legal-moves)")
     lc0.add_argument("--lc0-nodes", type=int, default=1, help="LC0 nodes for single-position eval (eval_before)")
     lc0.add_argument("--lc0-multipv-nodes", type=int, default=250,
-                     help="LC0 nodes for all-legal-moves multipv=218 call (default 250)")
+                     help="LC0 nodes floor for dynamic all-legal-moves multipv (default 250)")
     lc0.add_argument("--lc0-nn-cache-size", type=int, default=50000,
                      help="LC0 NNCache size (default 200000)")
     lc0.add_argument("--lc0-workers", type=int, default=2, help="Number of LC0 workers")

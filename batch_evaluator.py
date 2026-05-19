@@ -2,9 +2,12 @@
 BatchLC0Evaluator and SyncBatchEvaluator — LC0 engine wrapper with WDL support.
 
 Evaluates positions via LC0 using chess.engine.SimpleEngine.
-Uses a SINGLE analyse() call with multipv=218 and PerPVCounters=True to
-evaluate ALL legal moves in one shot. Each PV gets its own independent
-search tree, giving genuine per-move eval + WDL.
+Uses a SINGLE analyse() call with dynamic multipv=n_legal (exact legal move
+count) and PerPVCounters=True to evaluate ALL legal moves in one shot. Each
+PV gets its own independent search tree, giving genuine per-move eval + WDL.
+
+Node budget scales dynamically with position complexity:
+  5×n_legal (cap 300), else 3×n_legal (cap 500), floor 150.
 
 Key LC0 settings for all-legal-moves coverage:
   - PerPVCounters=True: each PV builds its own search tree
@@ -13,8 +16,8 @@ Key LC0 settings for all-legal-moves coverage:
   - CPuct=5.0: heavy exploration bias
   - PolicyTemperature=10.0: flatten policy for uniform coverage
 
-Speed: One engine.analyse() call per position with nodes=100 and
-multipv=218 (~5-15ms on RTX 4090). GPU batches all NN evals internally.
+Speed: One engine.analyse() call per position with dynamic nodes and
+multipv=n_legal (~5-15ms on RTX 4090). GPU batches all NN evals internally.
 ~10-30x faster than individual per-move UCI calls.
 """
 
@@ -69,7 +72,7 @@ class BatchLC0Evaluator:
         backend: str = "cuda-fp16",
         batch_size: int = 256,
         nodes: int = 1,
-        multipv_nodes: int = 100,  # Legacy default; now using dynamic nodes (3x legal moves, cap 150, else 2x cap 250)
+        multipv_nodes: int = 100,  # Legacy default; dynamic nodes computed in evaluate_all_legal_moves()
         nn_cache_size: int = 50000,
         threads: int = 1,
     ):
@@ -190,9 +193,15 @@ class BatchLC0Evaluator:
         """
         Evaluate EVERY legal move in ONE engine call.
 
-        Uses multipv=218 with PerPVCounters=True. Each PV gets its own
-        independent search tree, so every legal move receives a genuine
-        NN evaluation with unique WDL — all from a single analyse() call.
+        Uses dynamic multipv=n_legal (exact legal move count) with
+        PerPVCounters=True. Each PV gets its own independent search tree,
+        so every legal move receives a genuine NN evaluation with unique
+        WDL — all from a single analyse() call.
+
+        Node budget scales dynamically:
+          - 5×n_legal (cap 300), else 3×n_legal (cap 500), floor 150.
+          - With PerPVCounters=True, ~30 legal moves × 5 = 150 nodes gives
+            ~5 visits per move on average — enough for stable per-move WDL.
 
         Returns a list of dicts, one per legal move:
             {
@@ -211,10 +220,6 @@ class BatchLC0Evaluator:
         Speed: ONE analyse() call per position (~5-15ms on RTX 4090).
         GPU batches all NN evals internally. ~10-30x faster than
         individual per-move calls.
-
-        Uses self.multipv_nodes (default 250) as the node budget.
-        With PerPVCounters=True, 250 nodes across ~30 legal moves gives
-        ~8 visits per move on average — enough for stable per-move WDL.
         """
         if self._engine is None:
             raise RuntimeError("Engine not started")
