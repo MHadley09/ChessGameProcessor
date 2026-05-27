@@ -15,10 +15,17 @@ Outputs:
     - report.txt         — human-readable summary
     - calibration.png    — calibration curves (4 subplots)
 
-Usage:
+Usage (sharded — preferred):
     python validate_mimo.py \
         --checkpoint checkpoints/best.pt \
-        --data       data/mimo_dataset/test.npz \
+        --data-dir   dataset/opus \
+        --split      test \
+        --output-dir validation_results
+
+Usage (legacy single-file):
+    python validate_mimo.py \
+        --checkpoint checkpoints/best.pt \
+        --data       data/test.npz \
         --output-dir validation_results
 """
 
@@ -33,7 +40,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from chess_mimo_model import ChessMIMOModel
-from mimo_dataset import MIMOCompactDataset
+from mimo_dataset_polars import MIMOCompactDataset, dynamic_collate
 
 # Optional sklearn / matplotlib
 try:
@@ -57,9 +64,24 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Dataset — uses MIMOCompactDataset from mimo_dataset.py
-# (planes built on-the-fly from FEN, no pre-stored planes)
+# Resolve data path
 # ---------------------------------------------------------------------------
+
+def resolve_data_path(args):
+    """Return the data path — either a shard directory or a single .npz file."""
+    if args.data_dir:
+        data_dir = Path(args.data_dir)
+        split_path = data_dir / args.split
+        if not split_path.is_dir():
+            raise FileNotFoundError(
+                f"No {args.split}/ subdirectory in {data_dir}. "
+                f"Available: {[d.name for d in data_dir.iterdir() if d.is_dir()]}"
+            )
+        return str(split_path)
+    elif args.data:
+        return args.data
+    else:
+        raise ValueError("Provide --data-dir (sharded) or --data (legacy single .npz)")
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +107,7 @@ def collect_predictions(model, loader, device):
 
         preds['move_logits'].append(
             torch.softmax(outputs['move_logits'], dim=-1).cpu().numpy())
-        preds['mistake_prob'].append(outputs['mistake_prob'].cpu().numpy())
+        preds['mistake_prob'].append(outputs['mistake_prob'].sigmoid().cpu().numpy())
         if 'win_prob_before' in outputs:
             preds['win_prob_before'].append(outputs['win_prob_before'].cpu().numpy())
         if 'win_prob_after' in outputs:
@@ -365,9 +387,23 @@ def _plot_multiclass_cal(ax, preds, targets, title, n_bins=10):
 def main():
     parser = argparse.ArgumentParser(description='Validate MIMO')
     parser.add_argument('--checkpoint', required=True)
-    parser.add_argument('--data',       required=True, help='.npz test set')
+    # --- Data source (pick one) ---
+    parser.add_argument('--data-dir', type=str, default=None,
+                        help='Root dataset dir with train/val/test shard subdirs')
+    parser.add_argument('--split', type=str, default='test',
+                        choices=['train', 'val', 'test'],
+                        help='Which split to validate on (used with --data-dir)')
+    parser.add_argument('--data', type=str, default=None,
+                        help='Legacy: single .npz or shard directory')
+    # --- Data loading ---
+    parser.add_argument('--cache-shards', type=int, default=2,
+                        help='Number of shards to keep in LRU cache per worker (mmap = cheap)')
+    parser.add_argument('--with-phase', action='store_true', help='Include game phase feature')
+    # --- Misc ---
     parser.add_argument('--output-dir', default='validation_results')
     parser.add_argument('--batch-size', type=int, default=128)
+    parser.add_argument('--num-workers', type=int, default=2,
+                        help='DataLoader workers (reduced for Windows shared memory)')
     parser.add_argument('--device',     default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
 
@@ -384,7 +420,7 @@ def main():
         cnn_channels=cfg.get('cnn_channels', 128),
         num_res_blocks=cfg.get('res_blocks', 6),
         tabular_dim=18,
-        max_possible=cfg.get('max_possible', 40),
+        max_possible=cfg.get('max_possible', 220),
         hidden_dim=cfg.get('hidden_dim', 256),
     ).to(device)
     model.load_state_dict(ckpt['model_state_dict'])
@@ -393,9 +429,16 @@ def main():
           f"{sum(p.numel() for p in model.parameters()):,} params")
 
     # Load data
-    ds = MIMOCompactDataset(args.data)
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
-    print(f"Validating on {len(ds):,} examples …")
+    data_path = resolve_data_path(args)
+    print(f"[DATA] Loading: {data_path}")
+    ds = MIMOCompactDataset(data_path, cache_shards=args.cache_shards,
+                            with_phase=args.with_phase)
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
+                        num_workers=args.num_workers, pin_memory=False,
+                        prefetch_factor=2 if args.num_workers > 0 else None,
+                        persistent_workers=args.num_workers > 0,
+                        collate_fn=dynamic_collate)
+    print(f"[DATA] {len(ds):,} examples → {len(loader):,} batches")
 
     # Run
     preds, targs, meta = collect_predictions(model, loader, device)

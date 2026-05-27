@@ -5,7 +5,7 @@ chess_mimo_model.py — Multi-Input Multi-Output Chess Behavior Prediction Model
 Architecture overview:
     ┌─────────────────────────────────────────────────────────────────────┐
     │                         INPUTS                                      │
-    │  current_planes (B,47,8,8)  tabular (B,10)  possible_planes (B,M,47,8,8) │
+    │  current_planes (B,23,8,8)  tabular (B,10)  possible_planes (B,M,47,8,8) │
     │                                             possible_scalars (B,M,6)│
     └────────┬──────────────────────┬─────────────────┬───────────────────┘
              │                      │                 │
@@ -95,15 +95,15 @@ class ResBlock(nn.Module):
 
 class BoardEncoder(nn.Module):
     """
-    6-residual-block CNN with SE attention for 47-plane chess positions.
+    6-residual-block CNN with SE attention for 23-plane chess positions.
 
-    Accepts either (B, 47, 8, 8) or flattened batches from possible moves
-    reshaped to (B*M, 47, 8, 8) externally.
+    Accepts either (B, 23, 8, 8) or flattened batches from possible moves
+    reshaped to (B*M, 23, 8, 8) externally.
     """
 
-    def __init__(self, in_planes: int = 47, channels: int = 128, num_res_blocks: int = 6):
+    def __init__(self, in_planes: int = 23, channels: int = 128, num_res_blocks: int = 6):
         super().__init__()
-        # Stem: project 47 input planes to `channels`
+        # Stem: project 23 input planes to `channels`
         self.stem = nn.Sequential(
             nn.Conv2d(in_planes, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
@@ -121,7 +121,7 @@ class BoardEncoder(nn.Module):
         self.out_dim = channels
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (N, 47, 8, 8) → (N, channels)"""
+        """x: (N, 23, 8, 8) → (N, channels)"""
         x = self.stem(x)
         x = self.tower(x)
         x = self.pool(x).flatten(1)
@@ -181,7 +181,9 @@ class PossibleMoveScalarEncoder(nn.Module):
         self.out_dim = output_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, M, input_dim) → (B, M, output_dim)"""
+        """x: (B, M, input_dim) → (B, M, output_dim)  OR  (N, input_dim) → (N, output_dim)"""
+        if x.ndim == 2:
+            return self.net(x)
         B, M, D = x.shape
         return self.net(x.reshape(B * M, D)).reshape(B, M, -1)
 
@@ -219,7 +221,7 @@ class ChessMIMOModel(nn.Module):
         cnn_channels: int = 128,
         num_res_blocks: int = 6,
         tabular_dim: int = 18,
-        max_possible: int = 40,
+        max_possible: int = 220,
         hidden_dim: int = 256,
         num_attn_heads: int = 4,
         dropout: float = 0.2,
@@ -231,7 +233,7 @@ class ChessMIMOModel(nn.Module):
 
         # ---- Encoders (shared CNN for current + possible boards) ----
         self.board_encoder = BoardEncoder(
-            in_planes=47, channels=cnn_channels, num_res_blocks=num_res_blocks
+            in_planes=23, channels=cnn_channels, num_res_blocks=num_res_blocks
         )
         self.tabular_encoder = TabularEncoder(
             input_dim=tabular_dim, output_dim=64, dropout=dropout * 0.5
@@ -288,13 +290,12 @@ class ChessMIMOModel(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
         )
 
-        # 2. Mistake probability (binary)
+        # 2. Mistake probability (binary — outputs logits, sigmoid applied in loss/inference)
         self.mistake_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid(),
         )
 
         # 3. Win prob before (WDL, 3-way) — uses masked context
@@ -348,29 +349,42 @@ class ChessMIMOModel(nn.Module):
         self,
         possible_planes: torch.Tensor,
         possible_scalars: torch.Tensor,
+        possible_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
         Encode each candidate move into an embedding vector.
 
+        Uses static reshape instead of boolean indexing so the entire
+        CNN + projection is compilable by torch.compile (no graph breaks).
+        Padding moves (zero planes) are processed through the CNN but
+        masked to zero afterward.
+
         Parameters
         ----------
-        possible_planes : (B, M, 47, 8, 8)
-        possible_scalars : (B, M, 11)
+        possible_planes : (B, M, 23, 8, 8)
+        possible_scalars : (B, M, 12)
+        possible_mask : (B, M)  — 1.0 for valid moves, 0.0 for padding
 
         Returns
         -------
         move_emb : (B, M, hidden_dim)
         """
         B, M, C, H, W = possible_planes.shape
-        # Flatten batch for CNN
+
+        # Static reshape — fully compilable, no graph breaks
         flat_planes = possible_planes.reshape(B * M, C, H, W)
-        flat_cnn = self.board_encoder(flat_planes)           # (B*M, cnn_channels)
-        cnn_out = flat_cnn.reshape(B, M, -1)                 # (B, M, cnn_channels)
-        # Encode scalars
-        scalar_out = self.move_scalar_encoder(possible_scalars)  # (B, M, 32)
-        # Combine and project
-        combined = torch.cat([cnn_out, scalar_out], dim=-1)  # (B, M, cnn_channels+32)
-        return self.move_proj(combined)                       # (B, M, hidden_dim)
+        flat_scalars = possible_scalars.reshape(B * M, -1)
+
+        # CNN + scalar encoder on all moves (padding included)
+        flat_cnn = self.board_encoder(flat_planes)               # (B*M, cnn_channels)
+        scalar_out = self.move_scalar_encoder(flat_scalars)      # (B*M, 32)
+        combined = torch.cat([flat_cnn, scalar_out], dim=-1)     # (B*M, cnn_channels+32)
+        proj = self.move_proj(combined)                          # (B*M, hidden_dim)
+
+        # Reshape back and zero out padding embeddings
+        move_emb = proj.reshape(B, M, self.hidden_dim)
+        move_emb = move_emb * possible_mask.unsqueeze(-1)        # mask padding
+        return move_emb
 
     def _cross_attend(
         self,
@@ -416,8 +430,8 @@ class ChessMIMOModel(nn.Module):
 
         Parameters
         ----------
-        current_planes : (B, 47, 8, 8)
-        possible_planes : (B, M, 47, 8, 8)
+        current_planes : (B, 23, 8, 8)
+        possible_planes : (B, M, 23, 8, 8)
         possible_scalars : (B, M, 11)
         possible_mask : (B, M)   — 1.0 for valid moves, 0.0 for padding
         tabular : (B, 18)
@@ -440,14 +454,19 @@ class ChessMIMOModel(nn.Module):
         B = current_planes.shape[0]
         M = possible_planes.shape[1]
 
+        # --- Clamp scalar inputs to float16-safe range ---
+        # Prevents inf/NaN from sentinel values (e.g. INT_MAX evals, extreme times)
+        tabular = tabular.clamp(-1e4, 1e4)
+        possible_scalars = possible_scalars.clamp(-1e4, 1e4)
+
         # --- Encode current board ---
         board_emb = self.board_encoder(current_planes)       # (B, 128)
 
         # --- Encode tabular ---
         tab_emb = self.tabular_encoder(tabular)              # (B, 64)
 
-        # --- Encode all candidate moves ---
-        move_emb = self._encode_possible_moves(possible_planes, possible_scalars)
+        # --- Encode all candidate moves (valid only — skips masked padding) ---
+        move_emb = self._encode_possible_moves(possible_planes, possible_scalars, possible_mask)
         # move_emb: (B, M, hidden_dim)
 
         # --- Context vector ---
@@ -476,49 +495,49 @@ class ChessMIMOModel(nn.Module):
         # HEAD 5: Time spent (log-scale)
         outputs['time_spent'] = self.time_head(global_hidden)        # (B, 1)
 
-        # HEAD 3: Win probability before move (MASKED during training)
-        if actual_idx is not None:
-            # Training: mask the actual move from cross-attention
-            mask_for_before = torch.ones(B, M, device=move_emb.device)
-            mask_for_before.scatter_(1, actual_idx.unsqueeze(1), 0.0)
-            pad_mask_before = pad_mask | (mask_for_before == 0)
-
-            attn_out_masked = self._cross_attend(context, move_emb, pad_mask_before)
-            attn_out_masked = self.attn_gate(attn_out_masked) * attn_out_masked  # gated
-            fused_masked = torch.cat([board_emb, tab_emb, attn_out_masked], dim=-1)
-            global_hidden_masked = self.fusion(fused_masked)
-            wdl_before = F.softmax(
-                self.wdl_before_head(global_hidden_masked), dim=-1
-            )  # (B, 3)
-        else:
-            # Inference: no move to mask, use full context
-            wdl_before = F.softmax(
-                self.wdl_before_head(global_hidden), dim=-1
-            )  # (B, 3)
+        # HEAD 3: Win probability before move
+        # Uses the same global_hidden as other heads — no masking needed.
+        # The cross-attention sees all legal moves as anonymous K/V pairs;
+        # which move was actually played is not encoded in the attention.
+        wdl_before = F.softmax(
+            self.wdl_before_head(global_hidden), dim=-1
+        )  # (B, 3)
         outputs['win_prob_before'] = wdl_before
 
         # ============================================================
-        # HEAD 1: Move logits — with auxiliary feedback
+        # HEAD 1: Move logits — with auxiliary feedback (packed for efficiency)
         # ============================================================
         # Detach auxiliary predictions so move loss doesn't corrupt aux heads
         aux_feedback = torch.cat([
-            outputs['mistake_prob'].detach(),   # (B, 1)
+            outputs['mistake_prob'].detach().sigmoid(),   # (B, 1) — logits → prob for aux
             outputs['time_spent'].detach(),     # (B, 1)
             wdl_before.detach(),                # (B, 3)
         ], dim=-1)  # (B, 5)
 
-        global_exp = global_hidden.unsqueeze(1).expand(-1, M, -1)   # (B, M, 256)
-        aux_exp = aux_feedback.unsqueeze(1).expand(-1, M, -1)       # (B, M, 5)
-        move_input = torch.cat([global_exp, move_emb, aux_exp], dim=-1)  # (B, M, 517)
-        move_scores = self.move_head(move_input).squeeze(-1)        # (B, M)
-        move_scores = move_scores.masked_fill(pad_mask, float('-inf'))
+        # Pack valid moves only — skip ~86% of move_head compute
+        valid = ~pad_mask  # (B, M) — True for valid moves
+        # Use torch.where for valid indices — always runs (no data-dependent branch)
+        batch_idx, move_idx = torch.where(valid)  # (N_valid,)
+        flat_move_emb = move_emb[batch_idx, move_idx]  # (N_valid, hidden_dim)
+        flat_global = global_hidden[batch_idx]  # (N_valid, 256)
+        flat_aux = aux_feedback[batch_idx]  # (N_valid, 5)
+        
+        # Compute scores for valid moves only
+        flat_input = torch.cat([flat_global, flat_move_emb, flat_aux], dim=-1)  # (N_valid, 517)
+        flat_scores = self.move_head(flat_input).squeeze(-1)  # (N_valid,)
+        
+        # Scatter back to (B, M) with -inf for padding (ensure dtype match for AMP)
+        move_scores = torch.full((B, M), float('-inf'), device=move_emb.device, dtype=torch.float32)
+        move_scores[batch_idx, move_idx] = flat_scores.to(move_scores.dtype)
+        
         outputs['move_logits'] = move_scores
 
         # ============================================================
         # HEAD 4: Win probability after move (sees actual move)
         # ============================================================
         if actual_idx is not None:
-            idx_exp = actual_idx.unsqueeze(-1).expand(-1, self.hidden_dim)  # (B, 256)
+            safe_aidx = actual_idx.clamp(min=0)
+            idx_exp = safe_aidx.unsqueeze(-1).expand(-1, self.hidden_dim)  # (B, 256)
             actual_move_emb = move_emb.gather(1, idx_exp.unsqueeze(1)).squeeze(1)
             wdl_after_input = torch.cat([global_hidden, actual_move_emb], dim=-1)
             outputs['win_prob_after'] = F.softmax(
@@ -565,32 +584,39 @@ class MIMOLoss(nn.Module):
         """
         losses: Dict[str, torch.Tensor] = {}
 
-        # 1. Move prediction — cross-entropy
+        # 1. Move prediction — cross-entropy (ignore actual_idx=-1 = move not found)
         if 'move_logits' in predictions and 'move_idx' in targets:
             losses['move_logits'] = F.cross_entropy(
-                predictions['move_logits'], targets['move_idx']
+                predictions['move_logits'], targets['move_idx'],
+                ignore_index=-1,
             )
 
-        # 2. Mistake — binary cross-entropy
+        # 2. Mistake — binary cross-entropy (with logits for AMP safety)
+        #    Mask out examples where actual_idx == -1 (no valid move found)
         if 'mistake_prob' in predictions and 'is_mistake' in targets:
-            losses['mistake_prob'] = F.binary_cross_entropy(
+            valid_mask = targets['move_idx'] >= 0
+            # Always compute BCE on full batch; masked positions contribute 0 via multiplication
+            raw_bce = F.binary_cross_entropy_with_logits(
                 predictions['mistake_prob'].squeeze(-1),
                 targets['is_mistake'],
+                reduction='none',
             )
+            # Mask invalid positions and mean over valid ones
+            masked_bce = raw_bce * valid_mask.float()
+            n_valid = valid_mask.float().sum().clamp(min=1.0)
+            losses['mistake_prob'] = masked_bce.sum() / n_valid
 
-        # 3. WDL before — KL divergence (target is one-hot from game result)
+        # 3. WDL before — stable cross-entropy against target distribution
+        #    (replaces F.kl_div which produces NaN with one-hot targets:
+        #     0 * log(0) = 0 * -inf = NaN in IEEE 754)
         if 'win_prob_before' in predictions and 'win_prob_before' in targets:
             log_pred = torch.log(predictions['win_prob_before'].clamp(min=1e-8))
-            losses['win_prob_before'] = F.kl_div(
-                log_pred, targets['win_prob_before'], reduction='batchmean'
-            )
+            losses['win_prob_before'] = -(targets['win_prob_before'] * log_pred).sum(dim=-1).mean()
 
-        # 4. WDL after — KL divergence
+        # 4. WDL after — same stable formulation
         if 'win_prob_after' in predictions and 'win_prob_after' in targets:
             log_pred = torch.log(predictions['win_prob_after'].clamp(min=1e-8))
-            losses['win_prob_after'] = F.kl_div(
-                log_pred, targets['win_prob_after'], reduction='batchmean'
-            )
+            losses['win_prob_after'] = -(targets['win_prob_after'] * log_pred).sum(dim=-1).mean()
 
         # 5. Time spent — Huber loss (robust to outliers)
         if 'time_spent' in predictions and 'time_spent_log' in targets:
@@ -629,8 +655,8 @@ if __name__ == '__main__':
     print(f"Model parameters: {n_params:,}")
 
     # Dummy inputs
-    current = torch.randn(B, 47, 8, 8)
-    poss_planes = torch.randn(B, M, 47, 8, 8)
+    current = torch.randn(B, 23, 8, 8)
+    poss_planes = torch.randn(B, M, 23, 8, 8)
     poss_scalars = torch.randn(B, M, 6)
     poss_mask = torch.ones(B, M)
     poss_mask[:, 25:] = 0  # last 15 are padding

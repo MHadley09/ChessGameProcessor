@@ -10,6 +10,7 @@ This version processes moves in chunks of 100K to avoid building giant task list
 """
 
 import argparse
+import bisect
 import json
 import math
 import os
@@ -33,7 +34,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 import torch
 import polars as pl
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 print("Imports complete, starting...", flush=True)
 
@@ -42,58 +43,85 @@ print("Imports complete, starting...", flush=True)
 # Plane codec
 # ---------------------------------------------------------------------------
 
-def board_to_planes(board: chess.Board, history: Optional[List[Tuple[int, int]]] = None) -> np.ndarray:
-    planes = np.zeros((47, 8, 8), dtype=np.float32)
+def _bb_to_planes_batch(bitboards: List[int]) -> np.ndarray:
+    """Convert N chess bitboards → (N, 8, 8) float32 planes via numpy batch ops.
+    
+    ~5-7× faster than per-square Python iteration. Each bitboard is a uint64
+    from python-chess (e.g. int(board.pieces(PAWN, WHITE))).
+    """
+    n = len(bitboards)
+    if n == 0:
+        return np.zeros((0, 8, 8), dtype=np.float32)
+    arr = np.array(bitboards, dtype=np.uint64)
+    raw = arr.view(np.uint8).reshape(n, 8)              # N × 8 bytes (little-endian)
+    bits = np.unpackbits(raw, axis=1).reshape(n, 8, 8)  # MSB-first per byte
+    bits = np.flip(bits, axis=2)                         # fix file order (LSB = A-file)
+    bits = np.flip(bits, axis=1)                         # rank 7 at row 0 (board top)
+    return np.ascontiguousarray(bits).astype(np.float32)
+
+
+def _piece_bitboards(board: chess.Board) -> List[int]:
+    """Return 12 bitboards in plane order: [W-pawn..W-king, B-pawn..B-king]."""
+    bbs = []
     for pt in range(1, 7):
-        for color in (chess.WHITE, chess.BLACK):
-            idx = (pt - 1) + 6 * color
-            for sq in board.pieces(pt, color):
-                planes[idx, 7 - sq // 8, sq % 8] = 1.0
+        bbs.append(int(board.pieces(pt, chess.WHITE)))
+    for pt in range(1, 7):
+        bbs.append(int(board.pieces(pt, chess.BLACK)))
+    return bbs
 
+
+NUM_PLANES = 23  # Reduced from 47 — history planes (12-35) were always zeros
+
+def board_to_planes(board: chess.Board, history: Optional[List[Tuple[int, int]]] = None) -> np.ndarray:
+    """Bitboard-accelerated FEN → (23, 8, 8) plane construction.
+
+    Plane layout (23 channels):
+        0-11:  piece planes (W-pawn..W-king, B-pawn..B-king)
+        12-13: last move from/to squares
+        14-15: second-to-last move from/to squares
+        16:    side to move (1.0 = White)
+        17:    White kingside castling
+        18:    White queenside castling
+        19:    Black kingside castling
+        20:    Black queenside castling
+        21:    en passant square
+        22:    halfmove clock / 100
+
+    History piece planes (old 12-35) removed — the board is constructed
+    from fen_before which has no move stack, so those channels were always
+    zeros.  Move history is still encoded via from/to square planes 12-15.
+    """
+    planes = np.zeros((NUM_PLANES, 8, 8), dtype=np.float32)
+
+    # --- Piece planes 0-11 ---
+    bbs = _piece_bitboards(board)
+    p12 = _bb_to_planes_batch(bbs)
+    for i in range(12):
+        if bbs[i]:
+            planes[i] = p12[i]
+
+    # --- Move history squares 12-15 ---
     if history:
-        try:
-            temp = board.copy()
-            if temp.move_stack and len(history) >= 1:
-                temp.pop()
-                for pt in range(1, 7):
-                    for color in (chess.WHITE, chess.BLACK):
-                        idx = 12 + (pt - 1) + 6 * color
-                        for sq in temp.pieces(pt, color):
-                            planes[idx, 7 - sq // 8, sq % 8] = 1.0
-        except Exception:
-            pass
-        try:
-            temp2 = board.copy()
-            if len(temp2.move_stack) >= 2 and len(history) >= 2:
-                temp2.pop()
-                temp2.pop()
-                for pt in range(1, 7):
-                    for color in (chess.WHITE, chess.BLACK):
-                        idx = 24 + (pt - 1) + 6 * color
-                        for sq in temp2.pieces(pt, color):
-                            planes[idx, 7 - sq // 8, sq % 8] = 1.0
-        except Exception:
-            pass
-
         if len(history) >= 1:
             fr, to = history[0]
             if fr is not None:
-                planes[36, 7 - fr // 8, fr % 8] = 1.0
-                planes[37, 7 - to // 8, to % 8] = 1.0
+                planes[12, 7 - fr // 8, fr % 8] = 1.0
+                planes[13, 7 - to // 8, to % 8] = 1.0
         if len(history) >= 2:
             fr, to = history[1]
             if fr is not None:
-                planes[38, 7 - fr // 8, fr % 8] = 1.0
-                planes[39, 7 - to // 8, to % 8] = 1.0
+                planes[14, 7 - fr // 8, fr % 8] = 1.0
+                planes[15, 7 - to // 8, to % 8] = 1.0
 
-    planes[40, :, :] = 1.0 if board.turn == chess.WHITE else 0.0
-    planes[41, :, :] = 1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0
-    planes[42, :, :] = 1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0
-    planes[43, :, :] = 1.0 if board.has_kingside_castling_rights(chess.BLACK) else 0.0
-    planes[44, :, :] = 1.0 if board.has_queenside_castling_rights(chess.BLACK) else 0.0
+    # --- Metadata planes 16-22 ---
+    planes[16, :, :] = 1.0 if board.turn == chess.WHITE else 0.0
+    planes[17, :, :] = 1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0
+    planes[18, :, :] = 1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0
+    planes[19, :, :] = 1.0 if board.has_kingside_castling_rights(chess.BLACK) else 0.0
+    planes[20, :, :] = 1.0 if board.has_queenside_castling_rights(chess.BLACK) else 0.0
     if board.ep_square is not None:
-        planes[45, 7 - board.ep_square // 8, board.ep_square % 8] = 1.0
-    planes[46, :, :] = min(board.halfmove_clock, 100) / 100.0
+        planes[21, 7 - board.ep_square // 8, board.ep_square % 8] = 1.0
+    planes[22, :, :] = min(board.halfmove_clock, 100) / 100.0
     return planes
 
 
@@ -401,29 +429,148 @@ def build_one_compact_wrapper(args_tuple):
 
 
 # ---------------------------------------------------------------------------
+# Shard-aware sampler — eliminates cross-shard cache thrashing
+# ---------------------------------------------------------------------------
+
+class ShardGroupSampler(Sampler):
+    """Shuffle shards, then shuffle within each shard.
+
+    Standard random shuffle scatters indices across all shards, causing
+    constant cache misses in the DataLoader workers.  This sampler groups
+    indices by shard so each worker processes one shard at a time, giving
+    near-100% cache hits while still randomising across epochs.
+    """
+
+    def __init__(self, shard_offsets, shard_counts, seed=42):
+        self.shard_offsets = list(shard_offsets)
+        self.shard_counts = list(shard_counts)
+        self.total = sum(shard_counts)
+        self.epoch = 0
+        self.seed = seed
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        shard_order = torch.randperm(len(self.shard_counts), generator=g)
+        for s in shard_order:
+            offset = self.shard_offsets[s]
+            count = self.shard_counts[s]
+            local_perm = torch.randperm(count, generator=g)
+            yield from (offset + local_perm).tolist()
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __len__(self):
+        return self.total
+
+
+# ---------------------------------------------------------------------------
+# Dynamic collate — pad possible moves to batch-max instead of global max
+# ---------------------------------------------------------------------------
+
+def dynamic_collate(batch):
+    """Custom collate that trims possible_* tensors to the actual max valid
+    moves in the batch, instead of the global max_possible (220).
+    
+    Typical chess positions have 20-40 legal moves, so this cuts tensor size
+    by ~70-80%, reducing shared memory pressure and GPU transfer time.
+    """
+    # Find actual max valid moves across the batch
+    max_valid = max(int(b['possible_mask'].sum().item()) for b in batch)
+    max_valid = max(max_valid, 1)  # safety floor
+    
+    # Trim possible_* tensors to max_valid
+    for b in batch:
+        b['possible_planes'] = b['possible_planes'][:max_valid]
+        b['possible_scalars'] = b['possible_scalars'][:max_valid]
+        b['possible_mask'] = b['possible_mask'][:max_valid]
+        # Clamp actual_idx to valid range (should already be < max_valid)
+        if b['actual_idx'].item() >= max_valid:
+            b['actual_idx'] = torch.tensor(-1, dtype=torch.long)
+    
+    return torch.utils.data.dataloader.default_collate(batch)
+
+
+# ---------------------------------------------------------------------------
 # Sharded Dataset
 # ---------------------------------------------------------------------------
 
 class MIMOCompactDataset(Dataset):
-    def __init__(self, data_path: str, max_possible: int = 40, cache_shards: int = 3, with_phase: bool = False):
+    # Keys that __getitem__ actually uses (possible_fen_after dropped — push/pop is faster)
+    _SHARD_LOAD_KEYS = frozenset([
+        'fen_before', 'game_to_position', 'possible_uci',
+        'possible_scalars', 'possible_mask', 'tabular',
+        'actual_idx', 'is_mistake', 'win_prob_before', 'win_prob_after',
+        'time_spent_log',
+    ])
+    # Numeric arrays that can be memory-mapped (zero per-worker RAM)
+    _NUMERIC_KEYS = frozenset([
+        'possible_scalars', 'possible_mask', 'tabular',
+        'actual_idx', 'is_mistake', 'win_prob_before', 'win_prob_after',
+        'time_spent_log',
+    ])
+    # Object arrays that must be fully loaded (small, ~175 MB per shard)
+    _OBJECT_KEYS = frozenset(['fen_before', 'game_to_position', 'possible_uci'])
+
+    def __init__(self, data_path: str, max_possible: int = 220, cache_shards: int = 2, with_phase: bool = False):
         self.data_path = Path(data_path)
         self.max_possible = max_possible
         self.cache_shards = cache_shards
         self.with_phase = with_phase
-        
+
         if self.data_path.is_dir():
-            self.shard_files = sorted([f for f in self.data_path.glob('*.npz')])
+            self.shard_files = sorted([str(f) for f in self.data_path.glob('*.npz')])
             if not self.shard_files:
                 raise FileNotFoundError(f"No .npz shards in {data_path}")
+
+            # --- One-time extraction: npz → individual .npy for mmap access ---
+            self._shard_npy_dirs = []
+            npy_cache_root = self.data_path / '.npy_cache'
+            needs_extraction = False
+            for f in self.shard_files:
+                npy_dir = npy_cache_root / Path(f).stem
+                self._shard_npy_dirs.append(npy_dir)
+                if not (npy_dir / '.ready').exists():
+                    needs_extraction = True
+
+            if needs_extraction:
+                npy_cache_root.mkdir(parents=True, exist_ok=True)
+                print("[DATA] Extracting shards to .npy cache for memory-mapped access "
+                      "(one-time, subsequent runs will skip)...", flush=True)
+                for i, f in enumerate(self.shard_files):
+                    npy_dir = self._shard_npy_dirs[i]
+                    if (npy_dir / '.ready').exists():
+                        continue
+                    npy_dir.mkdir(parents=True, exist_ok=True)
+                    stem = Path(f).stem
+                    print(f"  [{i+1}/{len(self.shard_files)}] {stem}...", end='', flush=True)
+                    npz = np.load(f, allow_pickle=True)
+                    for k in npz.files:
+                        # Only extract numeric keys (mmap-able). Object arrays
+                        # (fen_before, game_to_position, possible_uci) are loaded
+                        # from the original .npz at shard-load time — saves ~30-40%
+                        # cache disk space.
+                        if k in self._NUMERIC_KEYS or (k == 'game_phase' and self.with_phase):
+                            np.save(str(npy_dir / f'{k}.npy'), npz[k], allow_pickle=True)
+                    npz.close()
+                    del npz
+                    gc.collect()
+                    (npy_dir / '.ready').touch()
+                    print(" done", flush=True)
+                print("[DATA] Extraction complete.", flush=True)
+
+            # Count shard sizes from the lightweight actual_idx .npy (fastest to load)
             self.shard_offsets = []
             self.shard_counts = []
             total = 0
-            for f in self.shard_files:
-                with np.load(f, allow_pickle=True) as data:
-                    n = len(data['fen_before'])
-                    self.shard_offsets.append(total)
-                    self.shard_counts.append(n)
-                    total += n
+            for npy_dir in self._shard_npy_dirs:
+                count_arr = np.load(str(npy_dir / 'actual_idx.npy'), mmap_mode='r')
+                n = len(count_arr)
+                self.shard_offsets.append(total)
+                self.shard_counts.append(n)
+                total += n
+                del count_arr
             self.n = total
             self._shard_cache = OrderedDict()
         else:
@@ -431,7 +578,6 @@ class MIMOCompactDataset(Dataset):
             self.fen_before = data['fen_before']
             self.game_to_position = data['game_to_position']
             self.possible_uci = data['possible_uci']
-            self.possible_fen_after = data['possible_fen_after']
             self.possible_scalars = data['possible_scalars']
             self.possible_mask = data['possible_mask']
             self.tabular = data['tabular']
@@ -444,33 +590,58 @@ class MIMOCompactDataset(Dataset):
                 self.game_phase = data['game_phase']
             self.n = len(self.fen_before)
             self.shard_files = None
+            self._shard_npy_dirs = None
         print(f"[DATA] {self.n:,} examples", flush=True)
 
     def __len__(self):
         return self.n
 
     def _load_shard(self, shard_idx):
+        """Load shard data via memory-mapped .npy files.
+
+        Numeric arrays (possible_scalars, etc.) are memory-mapped — the OS
+        pages in only the rows actually accessed, so per-worker RAM is near
+        zero.  Object arrays (fen strings, UCI strings) are small and loaded
+        fully (~175 MB per shard).
+        """
         if shard_idx in self._shard_cache:
             self._shard_cache.move_to_end(shard_idx)
             return self._shard_cache[shard_idx]
         while len(self._shard_cache) >= self.cache_shards:
             self._shard_cache.popitem(last=False)
-        data = np.load(self.shard_files[shard_idx], allow_pickle=True)
-        shard_data = {k: data[k] for k in data.files}
+
+        npy_dir = self._shard_npy_dirs[shard_idx]
+        shard_data = {}
+
+        # Numeric arrays: memory-mapped from .npy cache (zero per-worker RAM)
+        for k in self._NUMERIC_KEYS:
+            npy_path = npy_dir / f'{k}.npy'
+            if npy_path.exists():
+                shard_data[k] = np.load(str(npy_path), mmap_mode='r')
+
+        # Object arrays: load from original .npz (not extracted to save disk)
+        npz = np.load(self.shard_files[shard_idx], allow_pickle=True)
+        for k in self._OBJECT_KEYS:
+            if k in npz.files:
+                shard_data[k] = npz[k]
+        # Keep npz handle alive so arrays stay valid; store ref for cleanup
+        shard_data['_npz_handle'] = npz
+
+        if self.with_phase:
+            gp_path = npy_dir / 'game_phase.npy'
+            if gp_path.exists():
+                shard_data['game_phase'] = np.load(str(gp_path), mmap_mode='r')
         self._shard_cache[shard_idx] = shard_data
         return shard_data
 
     def __getitem__(self, idx):
         if self.shard_files:
-            shard_idx = 0
-            while shard_idx < len(self.shard_offsets) - 1 and idx >= self.shard_offsets[shard_idx + 1]:
-                shard_idx += 1
+            shard_idx = bisect.bisect_right(self.shard_offsets, idx) - 1
             local_idx = idx - self.shard_offsets[shard_idx]
             data = self._load_shard(shard_idx)
             fen_before = str(data['fen_before'][local_idx])
             gtp = str(data['game_to_position'][local_idx])
             possible_uci = data['possible_uci'][local_idx]
-            possible_fen_after = data['possible_fen_after'][local_idx]
             possible_scalars = data['possible_scalars'][local_idx]
             possible_mask = data['possible_mask'][local_idx]
             tabular = data['tabular'][local_idx]
@@ -484,7 +655,6 @@ class MIMOCompactDataset(Dataset):
             fen_before = str(self.fen_before[idx])
             gtp = str(self.game_to_position[idx])
             possible_uci = self.possible_uci[idx]
-            possible_fen_after = self.possible_fen_after[idx]
             possible_scalars = self.possible_scalars[idx]
             possible_mask = self.possible_mask[idx]
             tabular = self.tabular[idx]
@@ -501,36 +671,37 @@ class MIMOCompactDataset(Dataset):
             recent = history[-2:] if history else []
             current_planes = board_to_planes(board, recent)
         except Exception:
-            current_planes = np.zeros((47, 8, 8), dtype=np.float32)
+            current_planes = np.zeros((NUM_PLANES, 8, 8), dtype=np.float32)
             recent = []
 
-        poss_planes = np.zeros((self.max_possible, 47, 8, 8), dtype=np.float32)
+        poss_planes = np.zeros((self.max_possible, NUM_PLANES, 8, 8), dtype=np.float32)
         for i in range(self.max_possible):
             if possible_mask[i] < 0.5:
                 break
-            fen_after = str(possible_fen_after[i]) if i < len(possible_fen_after) else ''
             uci = str(possible_uci[i]) if i < len(possible_uci) else ''
-            if not fen_after or not uci:
+            if not uci or len(uci) < 4:
                 continue
             try:
-                board_after = chess.Board(fen_after)
-                from_sq = chess.parse_square(uci[:2])
-                to_sq = chess.parse_square(uci[2:4])
-                poss_hist = [(from_sq, to_sq)] + (recent[:1] if recent else [])
-                poss_planes[i] = board_to_planes(board_after, poss_hist)
+                # Push/pop on the current board — avoids FEN string parsing
+                move = chess.Move.from_uci(uci)
+                board.push(move)
+                # history=None: skip expensive board.copy()+pop() for history planes
+                # Possible-move boards don't need historical context
+                poss_planes[i] = board_to_planes(board, history=None)
+                board.pop()
             except Exception:
                 pass
 
         out = {
-            'current_planes': torch.from_numpy(current_planes).float(),
-            'possible_planes': torch.from_numpy(poss_planes).float(),
-            'possible_scalars': torch.from_numpy(possible_scalars).float(),
-            'possible_mask': torch.from_numpy(possible_mask).float(),
-            'tabular': torch.from_numpy(tabular).float(),
+            'current_planes': torch.from_numpy(current_planes).half(),
+            'possible_planes': torch.from_numpy(poss_planes).half(),
+            'possible_scalars': torch.from_numpy(possible_scalars.copy()).float(),
+            'possible_mask': torch.from_numpy(possible_mask.copy()).float(),
+            'tabular': torch.from_numpy(tabular.copy()).float(),
             'actual_idx': torch.tensor(actual_idx, dtype=torch.long),
             'is_mistake': torch.tensor(is_mistake, dtype=torch.float32),
-            'win_prob_before': torch.from_numpy(win_prob_before).float(),
-            'win_prob_after': torch.from_numpy(win_prob_after).float(),
+            'win_prob_before': torch.from_numpy(win_prob_before.copy()).float(),
+            'win_prob_after': torch.from_numpy(win_prob_after.copy()).float(),
             'time_spent_log': torch.tensor(time_spent_log, dtype=torch.float32),
         }
         if self.with_phase:
@@ -599,7 +770,7 @@ def process_moves_chunked(moves_df, games_dict, poss_index, max_possible, with_p
 # Build dataset (per-worker, chunked)
 # ---------------------------------------------------------------------------
 
-def build_dataset(data_dir: str, output_dir: str, max_possible: int = 40,
+def build_dataset(data_dir: str, output_dir: str, max_possible: int = 220,
                   min_elo: int = 0, max_elo: int = 0, val_frac: float = 0.1,
                   test_frac: float = 0.05, workers: int = 4, seed: int = 42,
                   with_phase: bool = False):
@@ -799,7 +970,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Build MIMO chess dataset (compact, per-worker, chunked)')
     parser.add_argument('--data-dir', required=True)
     parser.add_argument('--output-dir', required=True)
-    parser.add_argument('--max-possible', type=int, default=40)
+    parser.add_argument('--max-possible', type=int, default=220)
     parser.add_argument('--min-elo', type=int, default=0)
     parser.add_argument('--max-elo', type=int, default=0)
     parser.add_argument('--val-frac', type=float, default=0.10)

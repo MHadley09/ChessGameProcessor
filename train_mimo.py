@@ -3,6 +3,9 @@
 train_mimo.py — Training script for the MIMO chess model.
 
 Features:
+    - Sharded dataset support (train/val/test directories of .npz shards)
+    - Backward-compatible with single .npz files
+    - On-the-fly FEN → plane construction (no pre-stored planes)
     - Mixed-precision (AMP) training for RTX 4090 efficiency
     - Cosine annealing with linear warmup
     - Learnable uncertainty-based multi-task loss weighting
@@ -12,15 +15,17 @@ Features:
     - Proper checkpoint saving (best + latest + periodic)
     - Reproducible with --seed
 
-Usage:
+Usage (sharded — preferred):
     python train_mimo.py \
-        --train-data data/mimo_dataset/train.npz \
-        --val-data   data/mimo_dataset/val.npz \
+        --data-dir dataset/opus \
         --output-dir checkpoints/run1 \
-        --epochs 30 \
-        --batch-size 64 \
-        --lr 3e-4 \
-        --device cuda
+        --epochs 30 --batch-size 512 --lr 3e-4
+
+Usage (legacy single-file):
+    python train_mimo.py \
+        --train-data data/train.npz \
+        --val-data   data/val.npz \
+        --output-dir checkpoints/run1
 """
 
 import argparse
@@ -34,22 +39,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
+from mimo_dataset_polars import MIMOCompactDataset, ShardGroupSampler, dynamic_collate
 
 from chess_mimo_model import ChessMIMOModel, MIMOLoss
-from mimo_dataset import MIMOCompactDataset
 
 try:
     from torch.utils.tensorboard import SummaryWriter
     HAS_TB = True
 except ImportError:
     HAS_TB = False
-
-
-# ---------------------------------------------------------------------------
-# Dataset — uses MIMOCompactDataset from mimo_dataset.py
-# (planes built on-the-fly from FEN, no pre-stored planes)
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -85,11 +84,33 @@ class WarmupCosineScheduler:
 
 
 # ---------------------------------------------------------------------------
+# Resolve dataset paths
+# ---------------------------------------------------------------------------
+
+def resolve_data_paths(args):
+    """Return (train_path, val_path) — either directories or single .npz files."""
+    if args.data_dir:
+        data_dir = Path(args.data_dir)
+        train_path = data_dir / 'train'
+        val_path = data_dir / 'val'
+        if not train_path.is_dir():
+            raise FileNotFoundError(f"No train/ subdirectory in {data_dir}")
+        if not val_path.is_dir():
+            raise FileNotFoundError(f"No val/ subdirectory in {data_dir}")
+        return str(train_path), str(val_path)
+    elif args.train_data and args.val_data:
+        return args.train_data, args.val_data
+    else:
+        raise ValueError("Provide --data-dir (sharded) or both --train-data and --val-data (legacy)")
+
+
+# ---------------------------------------------------------------------------
 # Train / validate one epoch
 # ---------------------------------------------------------------------------
 
 def train_epoch(model, loader, criterion, optimizer, scheduler, scaler,
-                device, epoch, use_amp):
+                device, epoch, use_amp, save_every_batches=0, out_dir=None,
+                resume_from_batch=0):
     model.train()
     running_loss = 0.0
     running_components = {}
@@ -99,6 +120,14 @@ def train_epoch(model, loader, criterion, optimizer, scheduler, scaler,
     t0 = time.time()
 
     for batch in loader:
+        n_batches += 1
+        # Skip batches already processed (mid-epoch resume)
+        if n_batches <= resume_from_batch:
+            scheduler.step()  # keep scheduler in sync
+            if n_batches % 10000 == 0:
+                print(f"  [RESUME] skipping batch {n_batches:,}/{resume_from_batch:,}...",
+                      flush=True)
+            continue
         cp = batch['current_planes'].to(device, non_blocking=True)
         pp = batch['possible_planes'].to(device, non_blocking=True)
         ps = batch['possible_scalars'].to(device, non_blocking=True)
@@ -116,9 +145,51 @@ def train_epoch(model, loader, criterion, optimizer, scheduler, scaler,
 
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast(enabled=use_amp):
+        with autocast('cuda', enabled=use_amp):
             outputs = model(cp, pp, ps, pm, tab, actual_idx=aidx)
             loss, loss_dict = criterion(outputs, targets)
+
+        # ---- NaN diagnostic (fires once, then continues) ----
+        if not hasattr(train_epoch, '_nan_diagnosed') and (
+            torch.isnan(loss) or torch.isinf(loss)
+        ):
+            train_epoch._nan_diagnosed = True
+            print("\n" + "=" * 60, flush=True)
+            print("  NaN/Inf DIAGNOSTIC (first occurrence)", flush=True)
+            print("=" * 60, flush=True)
+            # Inputs
+            for iname, ival in [('current_planes', cp), ('possible_planes', pp),
+                                ('possible_scalars', ps), ('possible_mask', pm),
+                                ('tabular', tab), ('actual_idx', aidx)]:
+                nans = torch.isnan(ival.float()).sum().item()
+                infs = torch.isinf(ival.float()).sum().item()
+                print(f"  INPUT  {iname:20s}  shape={str(list(ival.shape)):20s}  "
+                      f"dtype={ival.dtype}  nan={nans}  inf={infs}  "
+                      f"min={ival.float().min().item():.4f}  max={ival.float().max().item():.4f}",
+                      flush=True)
+            # Outputs
+            for oname, oval in outputs.items():
+                nans = torch.isnan(oval.float()).sum().item()
+                infs = torch.isinf(oval.float()).sum().item()
+                print(f"  OUTPUT {oname:20s}  shape={str(list(oval.shape)):20s}  "
+                      f"dtype={oval.dtype}  nan={nans}  inf={infs}  "
+                      f"min={oval.float().min().item():.4f}  max={oval.float().max().item():.4f}",
+                      flush=True)
+            # Targets
+            for tname, tval in targets.items():
+                nans = torch.isnan(tval.float()).sum().item()
+                infs = torch.isinf(tval.float()).sum().item()
+                print(f"  TARGET {tname:20s}  shape={str(list(tval.shape)):20s}  "
+                      f"dtype={tval.dtype}  nan={nans}  inf={infs}  "
+                      f"min={tval.float().min().item():.4f}  max={tval.float().max().item():.4f}",
+                      flush=True)
+            # Individual losses
+            for lname, lval in loss_dict.items():
+                print(f"  LOSS   {lname:20s}  = {lval:.6f}", flush=True)
+            # Kendall log_vars
+            for pname, pval in criterion.named_parameters():
+                print(f"  PARAM  {pname:20s}  = {pval.item():.6f}", flush=True)
+            print("=" * 60 + "\n", flush=True)
 
         if use_amp:
             scaler.scale(loss).backward()
@@ -136,7 +207,31 @@ def train_epoch(model, loader, criterion, optimizer, scheduler, scaler,
         running_loss += loss.item()
         for k, v in loss_dict.items():
             running_components[k] = running_components.get(k, 0.0) + v
-        n_batches += 1
+
+        # Progress logging every 1000 batches
+        if n_batches % 1000 == 0:
+            elapsed_sofar = time.time() - t0
+            avg_loss_sofar = running_loss / n_batches
+            batches_per_sec = n_batches / elapsed_sofar
+            print(f"  [TRAIN] batch {n_batches:,}/{len(loader):,} "
+                  f"({100*n_batches/len(loader):.1f}%) "
+                  f"loss={avg_loss_sofar:.4f} "
+                  f"speed={batches_per_sec:.1f} b/s "
+                  f"elapsed={elapsed_sofar/60:.1f}m", flush=True)
+
+        # Mid-epoch checkpoint
+        if save_every_batches > 0 and n_batches % save_every_batches == 0 and out_dir is not None:
+            mid_ckpt = {
+                'epoch': epoch, 'batch': n_batches,
+                'model_state_dict': model.state_dict(),
+                'criterion_state_dict': criterion.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_step': scheduler._step,
+                'scaler_state_dict': scaler.state_dict(),
+                'mid_epoch': True,
+            }
+            torch.save(mid_ckpt, out_dir / 'mid_epoch.pt')
+            print(f"  [CKPT] Mid-epoch checkpoint saved at batch {n_batches:,}", flush=True)
 
         # Move accuracy
         preds = outputs['move_logits'].argmax(dim=1)
@@ -178,7 +273,7 @@ def validate(model, loader, criterion, device, use_amp):
             'time_spent_log':  batch['time_spent_log'].to(device, non_blocking=True),
         }
 
-        with autocast(enabled=use_amp):
+        with autocast('cuda', enabled=use_amp):
             outputs = model(cp, pp, ps, pm, tab, actual_idx=aidx)
             loss, loss_dict = criterion(outputs, targets)
 
@@ -199,7 +294,7 @@ def validate(model, loader, criterion, device, use_amp):
             total_moves += valid.sum().item()
 
         # Mistake accuracy
-        mistake_pred = (outputs['mistake_prob'].squeeze(-1) > 0.5).float()
+        mistake_pred = (outputs['mistake_prob'].squeeze(-1) > 0.0).float()  # logits: >0 = prob >0.5
         mistake_correct += (mistake_pred == targets['is_mistake']).float().sum().item()
         mistake_total += len(targets['is_mistake'])
 
@@ -221,31 +316,55 @@ def validate(model, loader, criterion, device, use_amp):
 
 def main():
     parser = argparse.ArgumentParser(description='Train MIMO model')
-    parser.add_argument('--train-data', required=True, help='.npz from mimo_dataset (compact format)')
-    parser.add_argument('--val-data',   required=True, help='.npz for validation')
+    # --- Data source (pick one) ---
+    parser.add_argument('--data-dir', type=str, default=None,
+                        help='Root dataset dir with train/ val/ test/ shard subdirs (preferred)')
+    parser.add_argument('--train-data', type=str, default=None,
+                        help='Legacy: single .npz or shard directory for training')
+    parser.add_argument('--val-data', type=str, default=None,
+                        help='Legacy: single .npz or shard directory for validation')
+    # --- Training ---
     parser.add_argument('--output-dir', default='checkpoints', help='Output directory')
     parser.add_argument('--epochs',     type=int,   default=30)
-    parser.add_argument('--batch-size', type=int,   default=64)
+    parser.add_argument('--batch-size', type=int,   default=512)
     parser.add_argument('--lr',         type=float, default=3e-4)
     parser.add_argument('--weight-decay', type=float, default=1e-4)
     parser.add_argument('--warmup-pct', type=float, default=0.05, help='Warmup fraction of total steps')
-    parser.add_argument('--max-possible', type=int, default=40)
+    # --- Model ---
+    parser.add_argument('--max-possible', type=int, default=220)
     parser.add_argument('--cnn-channels', type=int, default=128)
     parser.add_argument('--res-blocks', type=int, default=6)
     parser.add_argument('--hidden-dim', type=int, default=256)
-    parser.add_argument('--num-workers', type=int, default=4)
+    # --- Data loading ---
+    parser.add_argument('--num-workers', type=int, default=2,
+                        help='DataLoader workers (2 default on Windows 32GB; try 4 on 64GB+ or Linux)')
+    parser.add_argument('--cache-shards', type=int, default=2,
+                        help='Number of shards to keep in LRU cache per worker (mmap = cheap)')
+    parser.add_argument('--with-phase', action='store_true', help='Include game phase feature')
+    parser.add_argument('--prefetch-factor', type=int, default=2,
+                        help='DataLoader prefetch factor per worker')
+    # --- Misc ---
     parser.add_argument('--device',     default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--no-amp',     action='store_true', help='Disable mixed precision')
+    parser.add_argument('--no-compile', action='store_true', help='Disable torch.compile')
+    parser.add_argument('--use-ort',    action='store_true',
+                        help='Wrap model with ONNX Runtime ORTModule (pip install onnxruntime-training)')
     parser.add_argument('--seed',       type=int, default=42)
     parser.add_argument('--save-every', type=int, default=1, help='Checkpoint every N epochs')
-    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from (e.g. checkpoints/latest.pt)')
+    parser.add_argument('--save-every-batches', type=int, default=10000,
+                        help='Mid-epoch checkpoint every N batches (0 to disable)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume from (e.g. checkpoints/latest.pt)')
     args = parser.parse_args()
 
     # Reproducibility
     torch.manual_seed(args.seed)
+    # Skip CUDA graph capture for dynamic shapes (dynamic_collate varies M per batch)
+    torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
     np.random.seed(args.seed)
     if 'cuda' in args.device:
         torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.benchmark = True
 
     device = torch.device(args.device)
     use_amp = ('cuda' in args.device) and not args.no_amp
@@ -253,17 +372,41 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Data ----
-    train_ds = MIMOCompactDataset(args.train_data)
-    val_ds   = MIMOCompactDataset(args.val_data)
+    train_path, val_path = resolve_data_paths(args)
+    print(f"\n[DATA] train: {train_path}")
+    print(f"[DATA] val:   {val_path}")
+
+    train_ds = MIMOCompactDataset(train_path, max_possible=args.max_possible,
+                                  cache_shards=args.cache_shards, with_phase=args.with_phase)
+    val_ds   = MIMOCompactDataset(val_path, max_possible=args.max_possible,
+                                  cache_shards=args.cache_shards, with_phase=args.with_phase)
+
+    # Shard-aware sampler: shuffle shards then within-shard for near-100% cache hits
+    train_sampler = None
+    if hasattr(train_ds, 'shard_offsets') and train_ds.shard_files:
+        train_sampler = ShardGroupSampler(
+            train_ds.shard_offsets, train_ds.shard_counts, seed=args.seed
+        )
 
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True, drop_last=True,
+        train_ds, batch_size=args.batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=args.num_workers, pin_memory=False, drop_last=True,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+        persistent_workers=args.num_workers > 0,
+        collate_fn=dynamic_collate,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True,
+        num_workers=args.num_workers, pin_memory=False,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+        persistent_workers=args.num_workers > 0,
+        collate_fn=dynamic_collate,
     )
+
+    print(f"[DATA] train: {len(train_ds):,} examples → {len(train_loader):,} batches")
+    print(f"[DATA] val:   {len(val_ds):,} examples → {len(val_loader):,} batches")
 
     # ---- Model ----
     model = ChessMIMOModel(
@@ -279,6 +422,25 @@ def main():
     print(f"        CNN channels={args.cnn_channels}, res_blocks={args.res_blocks}, "
           f"hidden={args.hidden_dim}, max_moves={args.max_possible}")
 
+    # ---- ONNX Runtime Training (ORTModule) ----
+    if args.use_ort:
+        try:
+            from onnxruntime.training.ortmodule import ORTModule
+            model = ORTModule(model)
+            print("[MODEL] ORTModule wrapper enabled (ONNX Runtime Training)")
+        except ImportError:
+            print("[MODEL] onnxruntime-training not installed, skipping ORTModule")
+        except Exception as e:
+            print(f"[MODEL] ORTModule failed, continuing without: {e}")
+
+    # ---- torch.compile (max-autotune for best Triton kernels, no CUDA graphs) ----
+    if not args.no_compile and not args.use_ort and hasattr(torch, 'compile'):
+        try:
+            model = torch.compile(model, mode='max-autotune-no-cudagraphs', fullgraph=True)
+            print("[MODEL] torch.compile(mode='max-autotune-no-cudagraphs', fullgraph=True) enabled")
+        except Exception as e:
+            print(f"[MODEL] torch.compile failed, continuing without: {e}")
+
     # ---- Optimiser / scheduler ----
     criterion = MIMOLoss().to(device)
     all_params = list(model.parameters()) + list(criterion.parameters())
@@ -287,10 +449,11 @@ def main():
     total_steps = len(train_loader) * args.epochs
     warmup_steps = int(total_steps * args.warmup_pct)
     scheduler = WarmupCosineScheduler(optimizer, warmup_steps, total_steps)
-    scaler = GradScaler(enabled=use_amp)
+    scaler = GradScaler('cuda', enabled=use_amp)
 
     # ---- Resume from checkpoint ----
     start_epoch = 1
+    resume_from_batch = 0
     best_val_loss = float('inf')
     history = []
     if args.resume:
@@ -299,20 +462,45 @@ def main():
         model.load_state_dict(ckpt['model_state_dict'])
         criterion.load_state_dict(ckpt['criterion_state_dict'])
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        start_epoch = ckpt['epoch'] + 1
+        if ckpt.get('mid_epoch'):
+            # Mid-epoch checkpoint: resume within the same epoch
+            start_epoch = ckpt['epoch']
+            resume_from_batch = ckpt['batch']
+            print(f"[RESUME] Mid-epoch resume: epoch {start_epoch}, batch {resume_from_batch:,}")
+        else:
+            start_epoch = ckpt['epoch'] + 1
         best_val_loss = ckpt.get('val_loss', float('inf'))
-        # Fast-forward scheduler to correct step
-        steps_done = ckpt['epoch'] * len(train_loader)
-        for _ in range(steps_done):
-            scheduler.step()
+        # Restore scheduler step count
+        if 'scheduler_step' in ckpt:
+            scheduler._step = ckpt['scheduler_step']
+            # Reapply LR from saved step
+            for pg, base_lr in zip(scheduler.optimizer.param_groups, scheduler.base_lrs):
+                if scheduler._step <= scheduler.warmup_steps:
+                    scale = scheduler._step / max(scheduler.warmup_steps, 1)
+                else:
+                    progress = (scheduler._step - scheduler.warmup_steps) / max(
+                        scheduler.total_steps - scheduler.warmup_steps, 1)
+                    scale = 0.5 * (1.0 + math.cos(math.pi * progress))
+                pg['lr'] = max(scheduler.min_lr, base_lr * scale)
+        else:
+            # Legacy checkpoint: fast-forward scheduler
+            steps_done = ckpt['epoch'] * len(train_loader)
+            for _ in range(steps_done):
+                scheduler.step()
+        if 'scaler_state_dict' in ckpt:
+            scaler.load_state_dict(ckpt['scaler_state_dict'])
         print(f"[RESUME] Resuming from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
 
     print(f"[TRAIN] epochs={args.epochs}, batch={args.batch_size}, lr={args.lr}, "
           f"warmup={warmup_steps} steps, total={total_steps} steps, AMP={use_amp}")
+    print(f"[TRAIN] workers={args.num_workers}, cache_shards={args.cache_shards}, "
+          f"prefetch={args.prefetch_factor}")
 
     # ---- Save config ----
     config = vars(args)
     config['n_params'] = n_params
+    config['train_examples'] = len(train_ds)
+    config['val_examples'] = len(val_ds)
     with open(out_dir / 'train_config.json', 'w') as f:
         json.dump(config, f, indent=2)
 
@@ -324,9 +512,18 @@ def main():
     # ---- Training loop ----
 
     for epoch in range(start_epoch, args.epochs + 1):
+        # Update shard sampler epoch for reshuffling
+        if train_sampler is not None and hasattr(train_sampler, 'set_epoch'):
+            train_sampler.set_epoch(epoch)
+
         train_loss, train_acc, train_comp, elapsed = train_epoch(
             model, train_loader, criterion, optimizer, scheduler, scaler,
-            device, epoch, use_amp)
+            device, epoch, use_amp,
+            save_every_batches=args.save_every_batches, out_dir=out_dir,
+            resume_from_batch=resume_from_batch if epoch == start_epoch else 0)
+        # Clear mid-epoch resume after first epoch processes
+        if epoch == start_epoch:
+            resume_from_batch = 0
 
         val_loss, val_metrics, val_comp = validate(
             model, val_loader, criterion, device, use_amp)
