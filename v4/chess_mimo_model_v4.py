@@ -323,10 +323,6 @@ class ChessMIMOModelV4(nn.Module):
             input_dim=hidden_dim, hidden_dim=expert_hidden,
             output_dim=3, n_layers=expert_layers, dropout=dropout,
         )
-        self.wdl_after_expert = ExpertModule(
-            input_dim=hidden_dim * 2, hidden_dim=expert_hidden,
-            output_dim=3, n_layers=expert_layers, dropout=dropout,
-        )
         self.mistake_expert = ExpertModule(
             input_dim=hidden_dim, hidden_dim=expert_hidden,
             output_dim=1, n_layers=expert_layers, dropout=dropout,
@@ -397,7 +393,7 @@ class ChessMIMOModelV4(nn.Module):
         Returns
         -------
         dict with keys: move_logits, mistake_prob, win_prob_before,
-                         win_prob_after (if actual_idx), time_spent
+                         time_spent
         """
         B = current_planes.shape[0]
         M = possible_from_sq.shape[1]
@@ -461,17 +457,6 @@ class ChessMIMOModelV4(nn.Module):
         move_scores = move_scores.masked_fill(pad_mask, float('-inf'))
         outputs['move_logits'] = move_scores
 
-        # ============================================================
-        # WDL AFTER (sees actual move)
-        # ============================================================
-        if actual_idx is not None:
-            safe_aidx = actual_idx.clamp(min=0)
-            idx_exp = safe_aidx.unsqueeze(-1).expand(-1, self.hidden_dim)
-            actual_move_emb = move_emb.gather(1, idx_exp.unsqueeze(1)).squeeze(1)
-            wdl_after_input = torch.cat([trunk_out, actual_move_emb], dim=-1)
-            _, wdl_after_logits = self.wdl_after_expert(wdl_after_input)
-            outputs['win_prob_after'] = F.softmax(wdl_after_logits, dim=-1)
-
         return outputs
 
 
@@ -480,7 +465,7 @@ class ChessMIMOModelV4(nn.Module):
 # ---------------------------------------------------------------------------
 
 class MIMOLoss(nn.Module):
-    HEADS = ['move_logits', 'mistake_prob', 'win_prob_before', 'win_prob_after', 'time_spent']
+    HEADS = ['move_logits', 'mistake_prob', 'win_prob_before', 'time_spent']
 
     def __init__(self):
         super().__init__()
@@ -508,10 +493,6 @@ class MIMOLoss(nn.Module):
         if 'win_prob_before' in predictions and 'win_prob_before' in targets:
             log_pred = torch.log(predictions['win_prob_before'].clamp(min=1e-8))
             losses['win_prob_before'] = -(targets['win_prob_before'] * log_pred).sum(-1).mean()
-
-        if 'win_prob_after' in predictions and 'win_prob_after' in targets:
-            log_pred = torch.log(predictions['win_prob_after'].clamp(min=1e-8))
-            losses['win_prob_after'] = -(targets['win_prob_after'] * log_pred).sum(-1).mean()
 
         if 'time_spent' in predictions and 'time_spent_log' in targets:
             losses['time_spent'] = F.huber_loss(
@@ -563,7 +544,6 @@ if __name__ == '__main__':
         'move_idx': torch.randint(0, 25, (B,)),
         'is_mistake': torch.randint(0, 2, (B,)).float(),
         'win_prob_before': F.softmax(torch.randn(B, 3), dim=-1),
-        'win_prob_after': F.softmax(torch.randn(B, 3), dim=-1),
         'time_spent_log': torch.rand(B) * 4,
     }
     criterion = MIMOLoss()
@@ -577,5 +557,3 @@ if __name__ == '__main__':
     outputs_infer = model(current, from_sq, to_sq, promo, poss_scalars, poss_mask, tabular)
     for k, v in outputs_infer.items():
         print(f"  {k:20s} {tuple(v.shape)}")
-    assert 'win_prob_after' not in outputs_infer
-    print("  ✓ win_prob_after correctly absent")

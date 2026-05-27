@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-validate_mimo.py — Comprehensive validation for all 5 MIMO heads.
+validate_mimo.py — Comprehensive validation for all 4 MIMO heads.
 
 Metrics computed:
     1. move_logits:       Top-1/3/5 accuracy, perplexity
     2. mistake_prob:      AUC-ROC, AUC-PR, calibration
-    3. win_prob_before:   Brier score, ECE, accuracy (with leakage check)
-    4. win_prob_after:    Brier score, ECE, accuracy
-    5. time_spent:        MAE, RMSE, Pearson r, Spearman ρ, bucket calibration
-    6. Leakage detector:  before should be LESS accurate than after
+    3. win_prob_before:   Brier score, ECE, accuracy
+    4. time_spent:        MAE, RMSE, Pearson r, Spearman ρ, bucket calibration
 
 Outputs:
     - metrics.json       — all numbers
     - report.txt         — human-readable summary
-    - calibration.png    — calibration curves (4 subplots)
+    - calibration.png    — calibration curves
 
 Usage (sharded — preferred):
     python validate_mimo.py \
@@ -112,14 +110,11 @@ def collect_predictions(model, loader, device):
         preds['mistake_prob'].append(outputs['mistake_prob'].sigmoid().cpu().numpy())
         if 'win_prob_before' in outputs:
             preds['win_prob_before'].append(outputs['win_prob_before'].cpu().numpy())
-        if 'win_prob_after' in outputs:
-            preds['win_prob_after'].append(outputs['win_prob_after'].cpu().numpy())
         preds['time_spent'].append(outputs['time_spent'].cpu().numpy())
 
         targs['move_idx'].append(batch['actual_idx'].numpy())
         targs['is_mistake'].append(batch['is_mistake'].numpy())
         targs['win_prob_before'].append(batch['win_prob_before'].numpy())
-        targs['win_prob_after'].append(batch['win_prob_after'].numpy())
         targs['time_spent_log'].append(batch['time_spent_log'].numpy())
 
         meta['move_no'].append(batch['tabular'][:, 4].numpy() * 200)  # un-normalise
@@ -212,7 +207,7 @@ def compute_all_metrics(preds, targs, meta):
     # ------------------------------------------------------------------
     # 3 & 4. Win probability before / after
     # ------------------------------------------------------------------
-    for key in ['win_prob_before', 'win_prob_after']:
+    for key in ['win_prob_before']:
         if key not in preds:
             continue
         print(f"\n3/4. {key.upper()}")
@@ -276,19 +271,13 @@ def compute_all_metrics(preds, targs, meta):
     print(f"\n6. LEAKAGE CHECK")
     print('-' * 40)
     before_acc = metrics.get('win_prob_before_accuracy', 0)
-    after_acc  = metrics.get('win_prob_after_accuracy', 0)
     print(f"  win_prob_before accuracy: {before_acc:.4f}")
-    print(f"  win_prob_after  accuracy: {after_acc:.4f}")
 
     if before_acc > 0.85:
         print("  ⚠  WARNING: win_prob_before suspiciously high — possible masking failure!")
         metrics['leakage_warning'] = True
-    elif before_acc > after_acc + 0.05:
-        print("  ⚠  WARNING: before MORE accurate than after — masking is likely broken!")
-        metrics['leakage_warning'] = True
     else:
-        gap = after_acc - before_acc
-        print(f"  ✓  Masking looks correct (after is {gap:.3f} more accurate)")
+        print(f"  ✓  win_prob_before accuracy looks reasonable")
         metrics['leakage_warning'] = False
 
     print('=' * 60)
@@ -327,11 +316,6 @@ def plot_calibration(preds, targs, output_dir):
     if 'win_prob_before' in preds:
         _plot_multiclass_cal(axes[0, 1], preds['win_prob_before'],
                              targs['win_prob_before'], 'WDL Before')
-
-    # WDL after
-    if 'win_prob_after' in preds:
-        _plot_multiclass_cal(axes[1, 0], preds['win_prob_after'],
-                             targs['win_prob_after'], 'WDL After')
 
     # Time
     ax = axes[1, 1]

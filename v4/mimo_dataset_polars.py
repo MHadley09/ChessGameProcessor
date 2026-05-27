@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-mimo_dataset_v3.py — Compact dataset for V3/V4 single-CNN MIMO models.
-
-Key change from V1/V2: __getitem__ no longer builds possible_planes (no per-move
-board_to_planes calls).  Instead outputs (possible_from_sq, possible_to_sq,
-possible_promo) integer tensors parsed from UCI move strings.
+mimo_dataset.py — Compact dataset for the MIMO chess model (per-worker streaming, chunked processing).
 
 Reads from Parquet files produced by LC0 processing pipeline.
 Processes one worker directory at a time with chunked task generation to avoid OOM.
@@ -74,86 +70,67 @@ def _piece_bitboards(board: chess.Board) -> List[int]:
     return bbs
 
 
-NUM_PLANES = 23  # Reduced from 47 — history planes (12-35) were always zeros
-
 def board_to_planes(board: chess.Board, history: Optional[List[Tuple[int, int]]] = None) -> np.ndarray:
-    """Bitboard-accelerated FEN → (23, 8, 8) plane construction.
-
-    Plane layout (23 channels):
-        0-11:  piece planes (W-pawn..W-king, B-pawn..B-king)
-        12-13: last move from/to squares
-        14-15: second-to-last move from/to squares
-        16:    side to move (1.0 = White)
-        17:    White kingside castling
-        18:    White queenside castling
-        19:    Black kingside castling
-        20:    Black queenside castling
-        21:    en passant square
-        22:    halfmove clock / 100
-
-    History piece planes (old 12-35) removed — the board is constructed
-    from fen_before which has no move stack, so those channels were always
-    zeros.  Move history is still encoded via from/to square planes 12-15.
+    """Bitboard-accelerated FEN → (47, 8, 8) plane construction.
+    
+    Uses numpy batch ops on python-chess bitboards instead of per-square
+    Python iteration. Drop-in replacement for the original version.
     """
-    planes = np.zeros((NUM_PLANES, 8, 8), dtype=np.float32)
+    planes = np.zeros((47, 8, 8), dtype=np.float32)
 
-    # --- Piece planes 0-11 ---
+    # --- Piece planes 0-11 (current position, batch all 12 at once) ---
     bbs = _piece_bitboards(board)
     p12 = _bb_to_planes_batch(bbs)
     for i in range(12):
         if bbs[i]:
             planes[i] = p12[i]
 
-    # --- Move history squares 12-15 ---
+    # --- History planes 12-35 (up to 2 previous positions) ---
     if history:
+        try:
+            temp = board.copy()
+            if temp.move_stack and len(history) >= 1:
+                temp.pop()
+                h_bbs = _piece_bitboards(temp)
+                h_p = _bb_to_planes_batch(h_bbs)
+                for i in range(12):
+                    if h_bbs[i]:
+                        planes[12 + i] = h_p[i]
+        except Exception:
+            pass
+        try:
+            temp2 = board.copy()
+            if len(temp2.move_stack) >= 2 and len(history) >= 2:
+                temp2.pop()
+                temp2.pop()
+                h_bbs2 = _piece_bitboards(temp2)
+                h_p2 = _bb_to_planes_batch(h_bbs2)
+                for i in range(12):
+                    if h_bbs2[i]:
+                        planes[24 + i] = h_p2[i]
+        except Exception:
+            pass
+
         if len(history) >= 1:
             fr, to = history[0]
             if fr is not None:
-                planes[12, 7 - fr // 8, fr % 8] = 1.0
-                planes[13, 7 - to // 8, to % 8] = 1.0
+                planes[36, 7 - fr // 8, fr % 8] = 1.0
+                planes[37, 7 - to // 8, to % 8] = 1.0
         if len(history) >= 2:
             fr, to = history[1]
             if fr is not None:
-                planes[14, 7 - fr // 8, fr % 8] = 1.0
-                planes[15, 7 - to // 8, to % 8] = 1.0
+                planes[38, 7 - fr // 8, fr % 8] = 1.0
+                planes[39, 7 - to // 8, to % 8] = 1.0
 
-    # --- Metadata planes 16-22 ---
-    planes[16, :, :] = 1.0 if board.turn == chess.WHITE else 0.0
-    planes[17, :, :] = 1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0
-    planes[18, :, :] = 1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0
-    planes[19, :, :] = 1.0 if board.has_kingside_castling_rights(chess.BLACK) else 0.0
-    planes[20, :, :] = 1.0 if board.has_queenside_castling_rights(chess.BLACK) else 0.0
+    planes[40, :, :] = 1.0 if board.turn == chess.WHITE else 0.0
+    planes[41, :, :] = 1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0
+    planes[42, :, :] = 1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0
+    planes[43, :, :] = 1.0 if board.has_kingside_castling_rights(chess.BLACK) else 0.0
+    planes[44, :, :] = 1.0 if board.has_queenside_castling_rights(chess.BLACK) else 0.0
     if board.ep_square is not None:
-        planes[21, 7 - board.ep_square // 8, board.ep_square % 8] = 1.0
-    planes[22, :, :] = min(board.halfmove_clock, 100) / 100.0
+        planes[45, 7 - board.ep_square // 8, board.ep_square % 8] = 1.0
+    planes[46, :, :] = min(board.halfmove_clock, 100) / 100.0
     return planes
-
-
-# ---------------------------------------------------------------------------
-# UCI move → (from_sq, to_sq, promo) parser
-# ---------------------------------------------------------------------------
-
-def parse_uci_move(uci: str) -> tuple:
-    """
-    Parse a UCI move string into (from_sq, to_sq, promo) integers.
-
-    from_sq, to_sq: 0-63 chess square index (0=a1, 63=h8)
-    promo: 0=none, 1=knight, 2=bishop, 3=rook, 4=queen
-
-    Examples:
-        parse_uci_move("e2e4")  → (12, 28, 0)
-        parse_uci_move("e7e8q") → (52, 60, 4)
-    """
-    from_file = ord(uci[0]) - ord('a')
-    from_rank = int(uci[1]) - 1
-    to_file   = ord(uci[2]) - ord('a')
-    to_rank   = int(uci[3]) - 1
-    from_sq = from_rank * 8 + from_file
-    to_sq   = to_rank   * 8 + to_file
-    promo = 0
-    if len(uci) >= 5:
-        promo = {'n': 1, 'b': 2, 'r': 3, 'q': 4}.get(uci[4].lower(), 0)
-    return from_sq, to_sq, promo
 
 
 # ---------------------------------------------------------------------------
@@ -174,13 +151,14 @@ def parse_game_to_position(gtp_str: str) -> List[Tuple[int, int]]:
     return moves
 
 
-def result_to_wdl(result: str, color: str) -> np.ndarray:
+def result_to_wdl(result: str) -> np.ndarray:
+    """Game outcome from White's perspective. No color parameter needed."""
     if result == '1-0':
-        return np.array([1., 0., 0.], dtype=np.float32) if color == 'White' else np.array([0., 0., 1.], dtype=np.float32)
+        return np.array([1., 0., 0.], dtype=np.float32)  # White won
     elif result == '0-1':
-        return np.array([1., 0., 0.], dtype=np.float32) if color == 'Black' else np.array([0., 0., 1.], dtype=np.float32)
+        return np.array([0., 0., 1.], dtype=np.float32)  # White lost
     else:
-        return np.array([0., 1., 0.], dtype=np.float32)
+        return np.array([0., 1., 0.], dtype=np.float32)  # Draw
 
 
 def _safe_float(val, default: float = 0.0) -> float:
@@ -272,14 +250,10 @@ def build_one_compact(move_dict: Dict, game_dict: Dict, possibles: List[Dict], m
         poss_fen_after_list.append(pm.get('fen_after', ''))
         pm_eval_stm = evals_stm[i]
 
-        if color == 'White':
-            pm_stm_win  = _safe_float(pm.get('white_win_perc'), 0.33)
-            pm_stm_draw = _safe_float(pm.get('draw_perc'), 0.34)
-            pm_stm_loss = _safe_float(pm.get('black_win_perc'), 0.33)
-        else:
-            pm_stm_win  = _safe_float(pm.get('black_win_perc'), 0.33)
-            pm_stm_draw = _safe_float(pm.get('draw_perc'), 0.34)
-            pm_stm_loss = _safe_float(pm.get('white_win_perc'), 0.33)
+        # WDL always from White's perspective
+        w_win  = _safe_float(pm.get('white_win_perc'), 0.33)
+        w_draw = _safe_float(pm.get('draw_perc'), 0.34)
+        w_loss = _safe_float(pm.get('black_win_perc'), 0.33)
 
         nodes_raw = _safe_float(pm.get('nodes'), 1)
         move_quality = ((pm_eval_stm - worst_eval_stm) / eval_range) if eval_range > 0 else 1.0
@@ -304,9 +278,9 @@ def build_one_compact(move_dict: Dict, game_dict: Dict, possibles: List[Dict], m
 
         poss_scalars_list.append(np.array([
             pm_eval_stm / 1000.0,
-            pm_stm_win,
-            pm_stm_draw,
-            pm_stm_loss,
+            w_win,
+            w_draw,
+            w_loss,
             math.log1p(nodes_raw) / 20.0,
             _safe_float(pm.get('depth'), 20) / 40.0,
             move_quality,
@@ -328,14 +302,10 @@ def build_one_compact(move_dict: Dict, game_dict: Dict, possibles: List[Dict], m
     eval_raw = _safe_float(move_dict.get('eval_before'), 0)
     eval_stm = eval_raw if color == 'White' else -eval_raw
 
-    if color == 'White':
-        stm_win_before  = _safe_float(move_dict.get('white_win_perc_before'), 0.33)
-        stm_draw_before = _safe_float(move_dict.get('draw_perc_before'), 0.34)
-        stm_loss_before = _safe_float(move_dict.get('black_win_perc_before'), 0.33)
-    else:
-        stm_win_before  = _safe_float(move_dict.get('black_win_perc_before'), 0.33)
-        stm_draw_before = _safe_float(move_dict.get('draw_perc_before'), 0.34)
-        stm_loss_before = _safe_float(move_dict.get('white_win_perc_before'), 0.33)
+    # WDL before — always White's perspective
+    white_win_before  = _safe_float(move_dict.get('white_win_perc_before'), 0.33)
+    white_draw_before = _safe_float(move_dict.get('draw_perc_before'), 0.34)
+    white_loss_before = _safe_float(move_dict.get('black_win_perc_before'), 0.33)
 
     initial_time, increment = parse_time_control(game_dict.get('time_control', ''))
     prev_capture = detect_prev_capture(move_dict.get('game_to_position', ''))
@@ -355,9 +325,9 @@ def build_one_compact(move_dict: Dict, game_dict: Dict, possibles: List[Dict], m
         _safe_float(move_dict.get('move_no')) / 200.0,
         1.0 if color == 'White' else 0.0,
         eval_stm / 1000.0,
-        stm_win_before,
-        stm_draw_before,
-        stm_loss_before,
+        white_win_before,
+        white_draw_before,
+        white_loss_before,
         initial_time / 3600.0,
         increment / 60.0,
         prev_capture,
@@ -377,47 +347,38 @@ def build_one_compact(move_dict: Dict, game_dict: Dict, possibles: List[Dict], m
 
     is_mistake = 0.0
     if actual_idx >= 0 and len(possibles) > 0:
-        def _expected_score(pm_dict, clr):
-            if clr == 'White':
-                w = _safe_float(pm_dict.get('white_win_perc'), 0.33)
-                d = _safe_float(pm_dict.get('draw_perc'), 0.34)
-            else:
-                w = _safe_float(pm_dict.get('black_win_perc'), 0.33)
-                d = _safe_float(pm_dict.get('draw_perc'), 0.34)
+        def _expected_score(pm_dict):
+            """Expected score from White's perspective — no color branching."""
+            w = _safe_float(pm_dict.get('white_win_perc'), 0.33)
+            d = _safe_float(pm_dict.get('draw_perc'), 0.34)
             return w + 0.5 * d
 
-        def _outcome_class(pm_dict, clr):
-            if clr == 'White':
-                w = _safe_float(pm_dict.get('white_win_perc'), 0.33)
-                d = _safe_float(pm_dict.get('draw_perc'), 0.34)
-                l = _safe_float(pm_dict.get('black_win_perc'), 0.33)
-            else:
-                w = _safe_float(pm_dict.get('black_win_perc'), 0.33)
-                d = _safe_float(pm_dict.get('draw_perc'), 0.34)
-                l = _safe_float(pm_dict.get('white_win_perc'), 0.33)
+        def _outcome_class(pm_dict):
+            """Outcome class from White's perspective — no color branching."""
+            w = _safe_float(pm_dict.get('white_win_perc'), 0.33)
+            d = _safe_float(pm_dict.get('draw_perc'), 0.34)
+            l = _safe_float(pm_dict.get('black_win_perc'), 0.33)
             mx = max(w, d, l)
             if mx == w: return 'W'
             elif mx == d: return 'D'
             return 'L'
 
-        best_idx = max(range(len(possibles)), key=lambda i: _expected_score(possibles[i], color))
-        best_es = _expected_score(possibles[best_idx], color)
-        played_es = _expected_score(possibles[actual_idx], color)
+        best_idx = max(range(len(possibles)), key=lambda i: _expected_score(possibles[i]))
+        best_es = _expected_score(possibles[best_idx])
+        played_es = _expected_score(possibles[actual_idx])
         drop = best_es - played_es
         avg_elo = (w_elo + b_elo) / 2
         threshold = 0.20 if avg_elo < 1500 else (0.15 if avg_elo < 2500 else 0.10)
         if drop > threshold:
             is_mistake = 1.0
         if drop > 0.05 and is_mistake == 0.0:
-            best_outcome = _outcome_class(possibles[best_idx], color)
-            played_outcome = _outcome_class(possibles[actual_idx], color)
+            best_outcome = _outcome_class(possibles[best_idx])
+            played_outcome = _outcome_class(possibles[actual_idx])
             outcome_rank = {'W': 2, 'D': 1, 'L': 0}
             if outcome_rank[played_outcome] < outcome_rank[best_outcome]:
                 is_mistake = 1.0
 
-    wdl_before = result_to_wdl(game_result, color)
-    color_after = 'Black' if color == 'White' else 'White'
-    wdl_after = result_to_wdl(game_result, color_after)
+    wdl_before = result_to_wdl(game_result)
     raw_ts = max(0.0, _safe_float(move_dict.get('time_spent')))
     time_spent_log = np.float32(math.log1p(raw_ts))
     gtp = str(move_dict.get('game_to_position', '')) if move_dict.get('game_to_position') else ''
@@ -433,7 +394,6 @@ def build_one_compact(move_dict: Dict, game_dict: Dict, possibles: List[Dict], m
         'actual_idx': np.int64(actual_idx),
         'is_mistake': np.float32(is_mistake),
         'win_prob_before': wdl_before,
-        'win_prob_after': wdl_after,
         'time_spent_log': time_spent_log,
     }
     
@@ -497,35 +457,6 @@ class ShardGroupSampler(Sampler):
 
 
 # ---------------------------------------------------------------------------
-# Dynamic collate — pad possible moves to batch-max instead of global max
-# ---------------------------------------------------------------------------
-
-def dynamic_collate(batch):
-    """Custom collate that trims possible_* tensors to the actual max valid
-    moves in the batch, instead of the global max_possible (220).
-    
-    Typical chess positions have 20-40 legal moves, so this cuts tensor size
-    by ~70-80%, reducing shared memory pressure and GPU transfer time.
-    """
-    # Find actual max valid moves across the batch
-    max_valid = max(int(b['possible_mask'].sum().item()) for b in batch)
-    max_valid = max(max_valid, 1)  # safety floor
-    
-    # Trim possible_* tensors to max_valid
-    for b in batch:
-        b['possible_from_sq'] = b['possible_from_sq'][:max_valid]
-        b['possible_to_sq']   = b['possible_to_sq'][:max_valid]
-        b['possible_promo']   = b['possible_promo'][:max_valid]
-        b['possible_scalars'] = b['possible_scalars'][:max_valid]
-        b['possible_mask'] = b['possible_mask'][:max_valid]
-        # Clamp actual_idx to valid range (should already be < max_valid)
-        if b['actual_idx'].item() >= max_valid:
-            b['actual_idx'] = torch.tensor(-1, dtype=torch.long)
-    
-    return torch.utils.data.dataloader.default_collate(batch)
-
-
-# ---------------------------------------------------------------------------
 # Sharded Dataset
 # ---------------------------------------------------------------------------
 
@@ -534,13 +465,13 @@ class MIMOCompactDataset(Dataset):
     _SHARD_LOAD_KEYS = frozenset([
         'fen_before', 'game_to_position', 'possible_uci',
         'possible_scalars', 'possible_mask', 'tabular',
-        'actual_idx', 'is_mistake', 'win_prob_before', 'win_prob_after',
+        'actual_idx', 'is_mistake', 'win_prob_before',
         'time_spent_log',
     ])
     # Numeric arrays that can be memory-mapped (zero per-worker RAM)
     _NUMERIC_KEYS = frozenset([
         'possible_scalars', 'possible_mask', 'tabular',
-        'actual_idx', 'is_mistake', 'win_prob_before', 'win_prob_after',
+        'actual_idx', 'is_mistake', 'win_prob_before',
         'time_spent_log',
     ])
     # Object arrays that must be fully loaded (small, ~175 MB per shard)
@@ -617,7 +548,6 @@ class MIMOCompactDataset(Dataset):
             self.actual_idx = data['actual_idx']
             self.is_mistake = data['is_mistake']
             self.win_prob_before = data['win_prob_before']
-            self.win_prob_after = data['win_prob_after']
             self.time_spent_log = data['time_spent_log']
             if with_phase and 'game_phase' in data:
                 self.game_phase = data['game_phase']
@@ -681,7 +611,6 @@ class MIMOCompactDataset(Dataset):
             actual_idx = int(data['actual_idx'][local_idx])
             is_mistake = float(data['is_mistake'][local_idx])
             win_prob_before = data['win_prob_before'][local_idx]
-            win_prob_after = data['win_prob_after'][local_idx]
             time_spent_log = float(data['time_spent_log'][local_idx])
             game_phase = int(data.get('game_phase', [0]*len(data['fen_before']))[local_idx]) if self.with_phase else 0
         else:
@@ -694,7 +623,6 @@ class MIMOCompactDataset(Dataset):
             actual_idx = int(self.actual_idx[idx])
             is_mistake = float(self.is_mistake[idx])
             win_prob_before = self.win_prob_before[idx]
-            win_prob_after = self.win_prob_after[idx]
             time_spent_log = float(self.time_spent_log[idx])
             game_phase = int(self.game_phase[idx]) if self.with_phase and hasattr(self, 'game_phase') else 0
 
@@ -704,15 +632,10 @@ class MIMOCompactDataset(Dataset):
             recent = history[-2:] if history else []
             current_planes = board_to_planes(board, recent)
         except Exception:
-            current_planes = np.zeros((NUM_PLANES, 8, 8), dtype=np.float32)
+            current_planes = np.zeros((47, 8, 8), dtype=np.float32)
             recent = []
 
-        # --- V3/V4: parse UCI moves into (from_sq, to_sq, promo) ---
-        # Replaces the expensive board_to_planes() loop from V1/V2.
-        # ~35 string parses vs ~35 chess.Board operations per example.
-        from_sqs = np.zeros(self.max_possible, dtype=np.int64)
-        to_sqs   = np.zeros(self.max_possible, dtype=np.int64)
-        promos   = np.zeros(self.max_possible, dtype=np.int64)
+        poss_planes = np.zeros((self.max_possible, 47, 8, 8), dtype=np.float32)
         for i in range(self.max_possible):
             if possible_mask[i] < 0.5:
                 break
@@ -720,25 +643,26 @@ class MIMOCompactDataset(Dataset):
             if not uci or len(uci) < 4:
                 continue
             try:
-                f, t, p = parse_uci_move(uci)
-                from_sqs[i] = f
-                to_sqs[i]   = t
-                promos[i]    = p
+                # Push/pop on the current board — avoids FEN string parsing
+                move = chess.Move.from_uci(uci)
+                from_sq = move.from_square
+                to_sq = move.to_square
+                poss_hist = [(from_sq, to_sq)] + (recent[:1] if recent else [])
+                board.push(move)
+                poss_planes[i] = board_to_planes(board, poss_hist)
+                board.pop()
             except Exception:
                 pass
 
         out = {
             'current_planes': torch.from_numpy(current_planes).half(),
-            'possible_from_sq': torch.from_numpy(from_sqs),
-            'possible_to_sq':   torch.from_numpy(to_sqs),
-            'possible_promo':   torch.from_numpy(promos),
+            'possible_planes': torch.from_numpy(poss_planes).half(),
             'possible_scalars': torch.from_numpy(possible_scalars.copy()).float(),
             'possible_mask': torch.from_numpy(possible_mask.copy()).float(),
             'tabular': torch.from_numpy(tabular.copy()).float(),
             'actual_idx': torch.tensor(actual_idx, dtype=torch.long),
             'is_mistake': torch.tensor(is_mistake, dtype=torch.float32),
             'win_prob_before': torch.from_numpy(win_prob_before.copy()).float(),
-            'win_prob_after': torch.from_numpy(win_prob_after.copy()).float(),
             'time_spent_log': torch.tensor(time_spent_log, dtype=torch.float32),
         }
         if self.with_phase:
@@ -966,7 +890,6 @@ def build_dataset(data_dir: str, output_dir: str, max_possible: int = 220,
                     'actual_idx': np.array([e['actual_idx'] for e in examples]),
                     'is_mistake': np.array([e['is_mistake'] for e in examples]),
                     'win_prob_before': np.stack([e['win_prob_before'] for e in examples]),
-                    'win_prob_after': np.stack([e['win_prob_after'] for e in examples]),
                     'time_spent_log': np.array([e['time_spent_log'] for e in examples]),
                 }
                 if with_phase:

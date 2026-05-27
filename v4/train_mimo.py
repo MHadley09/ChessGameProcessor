@@ -141,7 +141,6 @@ def train_epoch(model, loader, criterion, optimizer, scheduler, scaler,
             'move_idx':        aidx,
             'is_mistake':      batch['is_mistake'].to(device, non_blocking=True),
             'win_prob_before': batch['win_prob_before'].to(device, non_blocking=True),
-            'win_prob_after':  batch['win_prob_after'].to(device, non_blocking=True),
             'time_spent_log':  batch['time_spent_log'].to(device, non_blocking=True),
         }
 
@@ -274,7 +273,6 @@ def validate(model, loader, criterion, device, use_amp):
             'move_idx':        aidx,
             'is_mistake':      batch['is_mistake'].to(device, non_blocking=True),
             'win_prob_before': batch['win_prob_before'].to(device, non_blocking=True),
-            'win_prob_after':  batch['win_prob_after'].to(device, non_blocking=True),
             'time_spent_log':  batch['time_spent_log'].to(device, non_blocking=True),
         }
 
@@ -348,6 +346,8 @@ def main():
     parser.add_argument('--with-phase', action='store_true', help='Include game phase feature')
     parser.add_argument('--prefetch-factor', type=int, default=2,
                         help='DataLoader prefetch factor per worker')
+    parser.add_argument('--pin-memory', action='store_true', default=False,
+                        help='Enable pin_memory for DataLoader (safe for V3 small tensors)')
     # --- Misc ---
     parser.add_argument('--device',     default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--no-amp',     action='store_true', help='Disable mixed precision')
@@ -397,14 +397,14 @@ def main():
         train_ds, batch_size=args.batch_size,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
-        num_workers=args.num_workers, pin_memory=False, drop_last=True,
+        num_workers=args.num_workers, pin_memory=args.pin_memory, drop_last=True,
         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
         persistent_workers=args.num_workers > 0,
         collate_fn=dynamic_collate,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=False,
+        num_workers=args.num_workers, pin_memory=args.pin_memory,
         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
         persistent_workers=args.num_workers > 0,
         collate_fn=dynamic_collate,

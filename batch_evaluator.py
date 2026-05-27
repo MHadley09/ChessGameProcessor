@@ -2,12 +2,9 @@
 BatchLC0Evaluator and SyncBatchEvaluator — LC0 engine wrapper with WDL support.
 
 Evaluates positions via LC0 using chess.engine.SimpleEngine.
-Uses a SINGLE analyse() call with dynamic multipv=n_legal (exact legal move
-count) and PerPVCounters=True to evaluate ALL legal moves in one shot. Each
-PV gets its own independent search tree, giving genuine per-move eval + WDL.
-
-Node budget scales dynamically with position complexity:
-  5×n_legal (cap 300), else 3×n_legal (cap 500), floor 150.
+Uses a SINGLE analyse() call with multipv=218 and PerPVCounters=True to
+evaluate ALL legal moves in one shot. Each PV gets its own independent
+search tree, giving genuine per-move eval + WDL.
 
 Key LC0 settings for all-legal-moves coverage:
   - PerPVCounters=True: each PV builds its own search tree
@@ -16,15 +13,13 @@ Key LC0 settings for all-legal-moves coverage:
   - CPuct=5.0: heavy exploration bias
   - PolicyTemperature=10.0: flatten policy for uniform coverage
 
-Speed: One engine.analyse() call per position with dynamic nodes and
-multipv=n_legal (~5-15ms on RTX 4090). GPU batches all NN evals internally.
-~10-30x faster than individual per-move UCI calls.
+Speed: One engine.analyse() call per position (~5-15ms on RTX 4090)
+instead of ~30 separate calls (~150ms+). GPU batches all NN evals
+internally.
 """
 
 import chess
 import chess.engine
-
-_VERSION = "uci-optimized-v5-nn-cache-flag"
 from typing import List, Optional, Dict
 from dataclasses import dataclass
 
@@ -35,11 +30,13 @@ MAX_LEGAL_MOVES = 218
 
 def _extract_wdl(info_entry: dict):
     """Extract WDL from an engine info dict entry, returning (w, d, l) as 0.0-1.0 or (None, None, None).
-    python-chess returns PovWdl — must call .white() to get raw Wdl with .wins/.draws/.losses."""
-    pov_wdl = info_entry.get("wdl")
-    if pov_wdl is not None:
-        w = pov_wdl.white()
-        return w.wins / 1000.0, w.draws / 1000.0, w.losses / 1000.0
+
+    Always returns White's perspective by calling .white() on the PovWdl object.
+    """
+    wdl_pov = info_entry.get("wdl")
+    if wdl_pov is not None:
+        wdl = wdl_pov.white()
+        return wdl.wins / 1000.0, wdl.draws / 1000.0, wdl.losses / 1000.0
     return None, None, None
 
 
@@ -72,30 +69,22 @@ class BatchLC0Evaluator:
         backend: str = "cuda-fp16",
         batch_size: int = 256,
         nodes: int = 1,
-        multipv_nodes: int = 100,  # Legacy default; dynamic nodes computed in evaluate_all_legal_moves()
-        nn_cache_size: int = 50000,
         threads: int = 1,
     ):
         self.lc0_path = lc0_path
         self.weights_path = weights_path
         self.backend = backend
         self.batch_size = batch_size
-        self.nodes = nodes                  # nodes for single-position eval (evaluate_position)
-        self.multipv_nodes = multipv_nodes  # nodes for all-legal-moves eval (evaluate_all_legal_moves)
-        self.nn_cache_size = nn_cache_size
+        self.nodes = nodes
         self.threads = threads
         self._engine: Optional[chess.engine.SimpleEngine] = None
 
     def start(self):
         """Start the LC0 engine process with all-legal-moves exploration settings."""
-        try:
-            self._engine = chess.engine.SimpleEngine.popen_uci(
-                self.lc0_path,
-                timeout=60,
-            )
-        except Exception as e:
-            self._engine = None
-            raise RuntimeError(f"Failed to start LC0 engine: {e}") from e
+        self._engine = chess.engine.SimpleEngine.popen_uci(
+            self.lc0_path,
+            timeout=60,
+        )
         self._engine.configure({
             "WeightsFile": self.weights_path,
             "Backend": self.backend,
@@ -109,10 +98,6 @@ class BatchLC0Evaluator:
             "FpuValue": 0,
             "CPuct": 5.0,
             "PolicyTemperature": 10.0,
-            # Performance tuning
-            "NNCacheSize": self.nn_cache_size,  # Configurable via flag
-            "OutOfOrderEval": True,   # Better GPU utilization
-            "MaxCollisionEvents": 32, # Reduce search thread contention
         })
 
     def evaluate_position(
@@ -193,15 +178,9 @@ class BatchLC0Evaluator:
         """
         Evaluate EVERY legal move in ONE engine call.
 
-        Uses dynamic multipv=n_legal (exact legal move count) with
-        PerPVCounters=True. Each PV gets its own independent search tree,
-        so every legal move receives a genuine NN evaluation with unique
-        WDL — all from a single analyse() call.
-
-        Node budget scales dynamically:
-          - 5×n_legal (cap 300), else 3×n_legal (cap 500), floor 150.
-          - With PerPVCounters=True, ~30 legal moves × 5 = 150 nodes gives
-            ~5 visits per move on average — enough for stable per-move WDL.
+        Uses multipv=218 with PerPVCounters=True. Each PV gets its own
+        independent search tree, so every legal move receives a genuine
+        NN evaluation with unique WDL — all from a single analyse() call.
 
         Returns a list of dicts, one per legal move:
             {
@@ -231,35 +210,25 @@ class BatchLC0Evaluator:
         n_legal = len(legal_moves)
 
         # Pre-compute SAN and fen_after for all legal moves (instant, no engine)
-        # Optimized: use push/pop instead of board.copy()
         move_info = {}
         for move in legal_moves:
             try:
                 san = board.san(move)
             except Exception:
                 san = move.uci()
-            board.push(move)
-            fen_after = board.fen()
-            board.pop()
+            board_copy = board.copy()
+            board_copy.push(move)
             move_info[move.uci()] = {
                 "san": san,
-                "fen_after": fen_after,
+                "fen_after": board_copy.fen(),
             }
 
-        # Dynamic nodes: 5x legal moves (cap 300), else 3x (cap 500), floor 150
-        # Higher node counts for better accuracy
-        n_legal = len(legal_moves)
-        nodes = 5 * n_legal
-        if nodes > 300:
-            nodes = min(3 * n_legal, 500)
-        nodes = max(nodes, 150)  # Floor at 150 nodes
-        
-        # Single call: multipv=n_legal (exact match to legal moves)
-        # PerPVCounters=True gives each PV its own search tree
+        # Single call: multipv=218, nodes=n_legal ensures each PV gets
+        # at least 1 visit with PerPVCounters=True
         infos = self._engine.analyse(
             board,
-            chess.engine.Limit(nodes=nodes),
-            multipv=n_legal,
+            chess.engine.Limit(nodes=max(n_legal, 1)),
+            multipv=MAX_LEGAL_MOVES,
             info=chess.engine.INFO_ALL,
         )
 
@@ -310,32 +279,60 @@ class BatchLC0Evaluator:
 
             results.append(entry)
 
-        # Warn if some legal moves were missed (rare edge case)
+        # Safety fallback: if any legal moves were missed (shouldn't happen
+        # with PerPVCounters + exploration settings), eval them individually
         if len(results) < n_legal:
-            missing = [m.uci() for m in legal_moves if m.uci() not in seen_moves]
-            import sys
-            print(
-                f"[WARN] multipv={n_legal} returned {len(results)}/{n_legal} "
-                f"legal moves. Missing: {missing[:5]}",
-                file=sys.stderr,
-            )
-            # Fill missing moves with None evals so downstream schema stays consistent
             for move in legal_moves:
                 uci = move.uci()
-                if uci not in seen_moves:
-                    mi = move_info.get(uci, {"san": uci, "fen_after": ""})
-                    results.append({
-                        "move_uci": uci,
-                        "move_san": mi["san"],
-                        "score_cp": None,
-                        "score_mate": None,
-                        "nodes": 0,
-                        "depth": 0,
-                        "wdl_w": None,
-                        "wdl_d": None,
-                        "wdl_l": None,
-                        "fen_after": mi["fen_after"],
-                    })
+                if uci in seen_moves:
+                    continue
+                mi = move_info[uci]
+                board_after = chess.Board(mi["fen_after"])
+                entry = {
+                    "move_uci": uci,
+                    "move_san": mi["san"],
+                    "score_cp": None,
+                    "score_mate": None,
+                    "nodes": 0,
+                    "depth": 0,
+                    "wdl_w": None,
+                    "wdl_d": None,
+                    "wdl_l": None,
+                    "fen_after": mi["fen_after"],
+                }
+                if board_after.is_game_over():
+                    if board_after.is_checkmate():
+                        if board_after.turn == chess.WHITE:
+                            entry.update(score_cp=-10000, score_mate=0,
+                                         wdl_w=0.0, wdl_d=0.0, wdl_l=1.0)
+                        else:
+                            entry.update(score_cp=10000, score_mate=0,
+                                         wdl_w=1.0, wdl_d=0.0, wdl_l=0.0)
+                    else:
+                        entry.update(score_cp=0, wdl_w=0.0, wdl_d=1.0, wdl_l=0.0)
+                else:
+                    try:
+                        fallback = self._engine.analyse(
+                            board_after,
+                            chess.engine.Limit(nodes=self.nodes),
+                            multipv=1,
+                            info=chess.engine.INFO_ALL,
+                        )
+                        top = fallback[0] if isinstance(fallback, list) else fallback
+                        s = top.get("score")
+                        if s:
+                            p = s.white()
+                            if p.is_mate():
+                                entry["score_mate"] = p.mate()
+                            else:
+                                entry["score_cp"] = p.score()
+                        fw, fd, fl = _extract_wdl(top)
+                        entry["wdl_w"] = fw
+                        entry["wdl_d"] = fd
+                        entry["wdl_l"] = fl
+                    except Exception:
+                        pass
+                results.append(entry)
 
         return results
 
@@ -344,10 +341,7 @@ class BatchLC0Evaluator:
             try:
                 self._engine.quit()
             except Exception:
-                try:
-                    self._engine.close()
-                except Exception:
-                    pass
+                pass
             self._engine = None
 
 

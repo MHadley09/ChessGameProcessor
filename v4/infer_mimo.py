@@ -5,11 +5,10 @@ infer_mimo.py — Real-time inference for the MIMO chess model.
 Given a chess position + game context, runs LC0 for engine evaluations
 then feeds everything through the MIMO model to predict human behavior.
 
-Predictions (all 5 heads):
+Predictions (4 heads):
     - Move probability distribution (what a human of given Elo would play)
     - Mistake probability for each candidate move
-    - Win/Draw/Loss before the move (position assessment)
-    - Win/Draw/Loss after each candidate move
+    - Win/Draw/Loss before the move (position assessment, from White's perspective)
     - Predicted thinking time (seconds)
 
 Usage:
@@ -33,16 +32,16 @@ import argparse
 import json
 import math
 import re
-import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import chess
+import chess.engine
 import numpy as np
 import torch
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 
 from chess_mimo_model_v4 import ChessMIMOModelV4
 
@@ -130,135 +129,127 @@ def board_to_planes_fast(board: chess.Board,
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 2 — LC0 UCI Engine Interface
+# SECTION 2 — LC0 Engine Interface (mirrors BatchLC0Evaluator from training pipeline)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class LC0Engine:
-    """Wraps LC0 in UCI mode for all-legal-moves evaluation."""
+    """Wraps LC0 via chess.engine.SimpleEngine for all-legal-moves evaluation.
+
+    Mirrors BatchLC0Evaluator from the training pipeline exactly:
+    same UCI options, same analyse() call pattern, same dynamic node formula.
+
+    Key LC0 settings for all-legal-moves coverage:
+      - PerPVCounters=True: each PV builds its own search tree
+      - SmartPruningFactor=0: no pruning of unpromising moves
+      - FpuStrategy=absolute, FpuValue=0: neutral first-play urgency
+      - CPuct=5.0: heavy exploration bias
+      - PolicyTemperature=10.0: flatten policy for uniform coverage
+    """
 
     def __init__(self, engine_path: str, weights_path: Optional[str] = None,
-                 nodes: int = 1, policy_temp: float = 10.0):
-        self.nodes = nodes
-        self.policy_temp = policy_temp
-        cmd = [engine_path]
-        if weights_path:
-            cmd += [f'--weights={weights_path}']
-        self.proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+                 backend: str = "cuda-fp16", batch_size: int = 256,
+                 threads: int = 1):
+        self._engine = chess.engine.SimpleEngine.popen_uci(
+            engine_path, timeout=60
         )
-        self._send('uci')
-        self._wait_for('uciok')
-        opts = {
-            'UCI_ShowWDL': 'true',
-            'SmartPruningFactor': '0',
-            'PerPVCounters': 'true',
-            'PolicyTemperature': str(policy_temp),
+        config = {
+            "UCI_ShowWDL": True,
+            "PerPVCounters": True,
+            "SmartPruningFactor": 0,
+            "FpuStrategy": "absolute",
+            "FpuValue": 0,
+            "CPuct": 5.0,
+            "PolicyTemperature": 10.0,
         }
-        for k, v in opts.items():
-            self._send(f'setoption name {k} value {v}')
-        self._send('isready')
-        self._wait_for('readyok')
-
-    def _send(self, cmd: str):
-        self.proc.stdin.write(cmd + '\n')
-        self.proc.stdin.flush()
-
-    def _wait_for(self, token: str) -> List[str]:
-        lines = []
-        while True:
-            line = self.proc.stdout.readline().strip()
-            lines.append(line)
-            if line.startswith(token):
-                return lines
+        if weights_path:
+            config["WeightsFile"] = weights_path
+        config["Backend"] = backend
+        config["MinibatchSize"] = batch_size
+        config["Threads"] = threads
+        self._engine.configure(config)
 
     def evaluate(self, board: chess.Board) -> Dict[str, Dict]:
         """
-        Evaluate all legal moves.  Returns {uci_move: {eval, wdl_w, wdl_d, wdl_l,
-        policy_prob, nodes, depth}} sorted by eval descending.
+        Evaluate all legal moves in a single engine.analyse() call.
+
+        Uses the same dynamic node formula and multipv strategy as
+        BatchLC0Evaluator.evaluate_all_legal_moves() in the training pipeline.
+
+        Returns {uci_move: {eval, wdl_w, wdl_d, wdl_l, nodes, depth, policy_prob}}
+        WDL values are 0.0-1.0.
         """
-        legal = list(board.legal_moves)
-        n_legal = len(legal)
+        legal_moves = list(board.legal_moves)
+        n_legal = len(legal_moves)
         if n_legal == 0:
             return {}
 
-        self._send('ucinewgame')
-        self._send(f'position fen {board.fen()}')
-        mpv = min(n_legal, 218)
-        self._send(f'go nodes {self.nodes * mpv} multipv {mpv}')
+        # Dynamic nodes: 5x legal moves (cap 300), else 3x (cap 500), floor 150
+        nodes = 5 * n_legal
+        if nodes > 300:
+            nodes = min(3 * n_legal, 500)
+        nodes = max(nodes, 150)
 
-        info_lines = self._wait_for('bestmove')
+        # Single call: multipv=n_legal (exact match to legal moves)
+        # PerPVCounters=True gives each PV its own search tree
+        infos = self._engine.analyse(
+            board,
+            chess.engine.Limit(nodes=nodes),
+            multipv=n_legal,
+            info=chess.engine.INFO_ALL,
+        )
+
+        if not isinstance(infos, list):
+            infos = [infos]
+
         results = {}
-
-        for line in info_lines:
-            if not line.startswith('info'):
+        for info in infos:
+            pv = info.get("pv")
+            if not pv:
                 continue
-            move_uci = self._parse_field(line, 'pv')
-            if not move_uci:
+            uci = pv[0].uci()
+            if uci in results:
                 continue
-            move_uci = move_uci.split()[0]  # first move of PV
 
-            cp = self._parse_int(line, 'cp')
-            wdl = self._parse_wdl(line)
-            nodes = self._parse_int(line, 'nodes') or 1
-            depth = self._parse_int(line, 'depth') or 1
+            # Score from white's perspective
+            score = info.get("score")
+            cp = 0
+            if score:
+                pov = score.white()
+                if pov.is_mate():
+                    cp = 10000 if pov.mate() > 0 else -10000
+                else:
+                    cp = pov.score() or 0
 
-            results[move_uci] = {
-                'eval': cp if cp is not None else 0,
-                'wdl_w': wdl[0] / 1000.0 if wdl else 0.33,
-                'wdl_d': wdl[1] / 1000.0 if wdl else 0.34,
-                'wdl_l': wdl[2] / 1000.0 if wdl else 0.33,
-                'nodes': nodes,
-                'depth': depth,
-                'policy_prob': 0.0,  # not directly available from UCI multipv
+            # WDL extraction — .white() gives White's perspective
+            # This is now stored/used directly as White's perspective (no STM flip)
+            wdl_pov = info.get("wdl")
+            if wdl_pov is not None:
+                wdl = wdl_pov.white()
+                wdl_w = wdl.wins / 1000.0
+                wdl_d = wdl.draws / 1000.0
+                wdl_l = wdl.losses / 1000.0
+            else:
+                wdl_w, wdl_d, wdl_l = 0.33, 0.34, 0.33
+
+            results[uci] = {
+                'eval': cp,
+                'wdl_w': wdl_w,
+                'wdl_d': wdl_d,
+                'wdl_l': wdl_l,
+                'nodes': info.get("nodes", 0),
+                'depth': info.get("depth", 0),
+                'policy_prob': 0.0,
             }
-
-        # Approximate policy from softmax of evals
-        if results:
-            evals = np.array([r['eval'] for r in results.values()], dtype=np.float64)
-            probs = np.exp(evals / 100.0)
-            probs /= probs.sum()
-            for i, k in enumerate(results):
-                results[k]['policy_prob'] = float(probs[i])
 
         return results
 
-    @staticmethod
-    def _parse_field(line: str, field: str) -> Optional[str]:
-        parts = line.split()
-        for i, p in enumerate(parts):
-            if p == field and i + 1 < len(parts):
-                return ' '.join(parts[i + 1:])
-        return None
-
-    @staticmethod
-    def _parse_int(line: str, field: str) -> Optional[int]:
-        parts = line.split()
-        for i, p in enumerate(parts):
-            if p == field and i + 1 < len(parts):
-                try:
-                    return int(parts[i + 1])
-                except ValueError:
-                    return None
-        return None
-
-    @staticmethod
-    def _parse_wdl(line: str) -> Optional[Tuple[int, int, int]]:
-        parts = line.split()
-        for i, p in enumerate(parts):
-            if p == 'wdl' and i + 3 < len(parts):
-                try:
-                    return (int(parts[i+1]), int(parts[i+2]), int(parts[i+3]))
-                except ValueError:
-                    return None
-        return None
-
     def close(self):
-        try:
-            self._send('quit')
-            self.proc.wait(timeout=5)
-        except Exception:
-            self.proc.kill()
+        if self._engine:
+            try:
+                self._engine.quit()
+            except Exception:
+                pass
+            self._engine = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -301,7 +292,8 @@ def build_features(board: chess.Board,
                    history: Optional[List[Tuple[int, int]]],
                    evals: Dict[str, Dict],
                    game_meta: Dict,
-                   max_possible: int = 40) -> Dict[str, torch.Tensor]:
+                   max_possible: int = 218,
+                   model_max_possible: int = 220) -> Dict[str, torch.Tensor]:
     """
     Build all MIMO input tensors for a single position.
 
@@ -370,19 +362,15 @@ def build_features(board: chess.Board,
     move_ucis = []
     for i, (move, uci, ev, stm_eval) in enumerate(move_eval_list):
         move_ucis.append(uci)
-        # WDL from STM perspective
-        if color == 'White':
-            wdl_w = ev.get('wdl_w', 0.33)
-            wdl_d = ev.get('wdl_d', 0.34)
-            wdl_l = ev.get('wdl_l', 0.33)
-        else:
-            wdl_w = ev.get('wdl_l', 0.33)   # STM win = opponent loss
-            wdl_d = ev.get('wdl_d', 0.34)
-            wdl_l = ev.get('wdl_w', 0.33)
+        # WDL always from White's perspective (LC0Engine.evaluate() uses .white())
+        # Scale LC0 WDL from 0-1 → 0-100 to match training data
+        wdl_w = ev.get('wdl_w', 0.0033) * 100.0
+        wdl_d = ev.get('wdl_d', 0.0034) * 100.0
+        wdl_l = ev.get('wdl_l', 0.0033) * 100.0
 
         nodes_raw = ev.get('nodes', 1)
         depth = ev.get('depth', 1)
-        policy_prob = ev.get('policy_prob', 0.0)
+        policy_prob = 0.0  # training data has no policy_prob column; always 0.0
         move_quality = (stm_eval - worst_eval_stm) / eval_range if eval_range > 0 else 1.0
 
         # Piece type of the moving piece
@@ -426,22 +414,18 @@ def build_features(board: chess.Board,
     # WDL before move (from position eval — use best move's WDL)
     if move_eval_list:
         best_ev = move_eval_list[0][2]
-        if color == 'White':
-            stm_win_before = best_ev.get('wdl_w', 0.33)
-            stm_draw_before = best_ev.get('wdl_d', 0.34)
-            stm_loss_before = best_ev.get('wdl_l', 0.33)
-        else:
-            stm_win_before = best_ev.get('wdl_l', 0.33)
-            stm_draw_before = best_ev.get('wdl_d', 0.34)
-            stm_loss_before = best_ev.get('wdl_w', 0.33)
+        # WDL always from White's perspective
+        white_win_before = best_ev.get('wdl_w', 0.0033) * 100.0
+        white_draw_before = best_ev.get('wdl_d', 0.0034) * 100.0
+        white_loss_before = best_ev.get('wdl_l', 0.0033) * 100.0
     else:
-        stm_win_before, stm_draw_before, stm_loss_before = 0.33, 0.34, 0.33
+        white_win_before, white_draw_before, white_loss_before = 0.33, 0.34, 0.33
 
     in_check = 1.0 if board.is_check() else 0.0
     eval_std = float(np.std(evals_stm)) / 1000.0 if len(evals_stm) > 1 else 0.0
     captures_frac = sum(possible_scalars[i, 8] for i in range(num_possible)) / max(num_possible, 1)
     checks_frac = sum(possible_scalars[i, 9] for i in range(num_possible)) / max(num_possible, 1)
-    num_candidates = num_possible / max_possible
+    num_candidates = num_possible / model_max_possible
 
     tabular = np.array([
         clock_time / 3600.0,
@@ -451,9 +435,9 @@ def build_features(board: chess.Board,
         min(move_no, 200) / 200.0,
         1.0 if color == 'White' else 0.0,
         eval_stm / 1000.0,
-        stm_win_before,
-        stm_draw_before,
-        stm_loss_before,
+        white_win_before,
+        white_draw_before,
+        white_loss_before,
         initial_time / 3600.0,
         increment / 60.0,
         prev_capture,
@@ -500,8 +484,12 @@ class MIMOPredictor:
             max_possible=cfg.get('max_possible', 220),
             hidden_dim=cfg.get('hidden_dim', 256),
         ).to(self.device)
-        self.model.load_state_dict(ckpt['model_state_dict'])
+        state_dict = ckpt['model_state_dict']
+        # Strip _orig_mod. prefix added by torch.compile() wrapping
+        state_dict = {k.removeprefix('_orig_mod.'): v for k, v in state_dict.items()}
+        self.model.load_state_dict(state_dict)
         self.model.eval()
+        self.max_possible = cfg.get('max_possible', 220)
         n_params = sum(p.numel() for p in self.model.parameters())
         epoch = ckpt.get('epoch', '?')
         print(f"Loaded epoch {epoch} — {n_params:,} params")
@@ -515,16 +503,14 @@ class MIMOPredictor:
         pp = features['possible_promo'].to(self.device)
         ps = features['possible_scalars'].to(self.device)
         pm = features['possible_mask'].to(self.device)
-        pm = features['possible_mask'].to(self.device)
         tab = features['tabular'].to(self.device)
         # No actual_idx at inference — pass None to skip training-only masked path
-        with autocast(enabled=(self.device.type == 'cuda')):
+        with autocast('cuda', enabled=(self.device.type == 'cuda')):
             out = self.model(cp, pf, pt, pp, ps, pm, tab, actual_idx=None)
 
         move_probs = torch.softmax(out['move_logits'], dim=-1).cpu().numpy()[0]
         mistake_prob = out['mistake_prob'].sigmoid().cpu().numpy()[0].item()
         wdl_before = out.get('win_prob_before')
-        wdl_after = out.get('win_prob_after')
         time_log = out['time_spent'].cpu().numpy()[0].item()
 
         preds = {
@@ -534,8 +520,6 @@ class MIMOPredictor:
         }
         if wdl_before is not None:
             preds['wdl_before'] = wdl_before.cpu().numpy()[0]  # already softmax from model
-        if wdl_after is not None:
-            preds['wdl_after'] = wdl_after.cpu().numpy()[0]  # already softmax from model
 
         return preds
 
@@ -560,7 +544,7 @@ def format_results(features: Dict, preds: Dict, board: chess.Board, top_k: int =
     # --- WDL Before ---
     if 'wdl_before' in preds:
         wdl = preds['wdl_before']
-        print(f"\n  Position assessment (WDL from {color}'s view):")
+        print(f"\n  Game outcome prediction (WDL from White's view):")
         print(f"    Win {wdl[0]:.1%}  |  Draw {wdl[1]:.1%}  |  Loss {wdl[2]:.1%}")
 
     # --- Predicted time ---
@@ -584,13 +568,6 @@ def format_results(features: Dict, preds: Dict, board: chess.Board, top_k: int =
         except Exception:
             san = uci
         print(f"  {rank+1:>4}  {uci:>8}  {san:>8}  {prob:>6.1%}  {cumulative:>6.1%}")
-
-    # --- WDL After (for top move) ---
-    if 'wdl_after' in preds:
-        wdl_a = preds['wdl_after']
-        top_move = move_ucis[ranked[0]] if len(ranked) > 0 else '?'
-        print(f"\n  After predicted move ({top_move}), from opponent's view:")
-        print(f"    Win {wdl_a[0]:.1%}  |  Draw {wdl_a[1]:.1%}  |  Loss {wdl_a[2]:.1%}")
 
     # --- Mistake probability ---
     print(f"\n  Mistake probability: {preds['mistake_prob']:.1%}")
@@ -629,12 +606,10 @@ def main():
     # Engine
     parser.add_argument('--lc0', required=True, help='Path to LC0 executable')
     parser.add_argument('--lc0-weights', type=str, default=None, help='Path to LC0 weights file')
-    parser.add_argument('--lc0-nodes', type=int, default=1,
-                        help='Nodes per move for LC0 (1 = raw neural net, no search)')
 
     # Model
     parser.add_argument('--checkpoint', required=True, help='Path to MIMO checkpoint (.pt)')
-    parser.add_argument('--max-possible', type=int, default=40)
+    parser.add_argument('--max-possible', type=int, default=218)
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
 
     # Output
@@ -699,9 +674,12 @@ def main():
         'prev_capture': prev_capture,
     }
 
+    # --- Load MIMO model first (to get training config for feature construction) ---
+    predictor = MIMOPredictor(args.checkpoint, args.device)
+
     # --- LC0 evaluation ---
     print(f"Starting LC0 ({args.lc0}) ...")
-    engine = LC0Engine(args.lc0, args.lc0_weights, nodes=args.lc0_nodes)
+    engine = LC0Engine(args.lc0, args.lc0_weights)
     t0 = time.time()
     evals = engine.evaluate(board)
     lc0_ms = (time.time() - t0) * 1000
@@ -714,12 +692,12 @@ def main():
 
     # --- Feature construction ---
     t0 = time.time()
-    features = build_features(board, history, evals, game_meta, args.max_possible)
+    features = build_features(board, history, evals, game_meta, args.max_possible,
+                              model_max_possible=predictor.max_possible)
     feat_ms = (time.time() - t0) * 1000
     print(f"Features built in {feat_ms:.1f}ms")
 
     # --- MIMO inference ---
-    predictor = MIMOPredictor(args.checkpoint, args.device)
     t0 = time.time()
     preds = predictor.predict(features)
     infer_ms = (time.time() - t0) * 1000
