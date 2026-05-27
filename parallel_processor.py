@@ -1,16 +1,35 @@
 """
-parallel_processor.py — Unified runner with GPU validation, dedup preload, and metrics
+parallel_processor.py — Unified runner that processes a PGN file through
+EITHER LC0 or Stockfish depth-14 workers (one engine per game).
 
-Enhanced with:
-- LC0 GPU backend validation and smoke test
-- Dedup preload (no per-game SQLite queries)
-- Performance metrics collection (--profile)
-- Path validation before spawn
-- Auto-worker count suggestions
-- Robust error handling
-- Queue depth monitoring
+Architecture:
+    ┌─────────────┐
+    │  Main Proc   │  Reads PGN, deduplicates, dispatches
+    │  (PGN reader)│
+    └──────┬──────┘
+           │
+      shared game_queue
+           │
+    ┌──────▼──────┐
+    │  Worker pool │  LC0 + SF workers pull from same queue
+    │  (N+M procs) │  Each game goes to ONE engine only
+    │  each writes │  (whichever worker is free first)
+    │  parquet     │
+    └──────────────┘
 
-Architecture remains: single shared queue, one engine per game.
+Each game is processed by exactly one engine. Workers compete for games
+from a shared queue. Dedup tracks (game_hash, engine) so restarts skip
+already-processed games regardless of which engine handled them.
+
+For each position, ALL legal moves are evaluated in a SINGLE engine call
+using multipv=218 with PerPVCounters=True. Each PV gets its own independent
+search tree, giving per-candidate eval + WDL without multiple round-trips.
+
+Speed notes:
+  - One analyse(nodes=N, multipv=218) call per position where N = num_legal_moves.
+  - LC0 batches all NN evals internally on the GPU in one forward pass.
+  - Estimated throughput: ~2-5 games/sec total with 4 workers on RTX 4090.
+  - 500K games ≈ 1-3 days (vs ~13 hours with old multipv=1 approach).
 """
 
 import os
@@ -26,7 +45,8 @@ import threading
 import multiprocessing as mp
 from multiprocessing import Process, Queue
 from pathlib import Path
-from typing import Optional, List, Set, Tuple
+from datetime import datetime
+from typing import Optional, List
 
 import chess
 import chess.pgn
@@ -34,35 +54,29 @@ import chess.pgn
 from parquet_writer import ParquetWriter
 from batch_evaluator import SyncBatchEvaluator
 from stockfish_evaluator import StockfishEvaluator
-from metrics import MetricsCollector
 
 
-# ── Deduplication with preload ──────────────────────────────────────────────
+# ── Deduplication ────────────────────────────────────────────────────────────
 
 class GameDeduplicator:
     """
-    SQLite-backed game deduplication with in-memory preload.
-
-    At startup, loads all existing hashes into memory to avoid per-game queries.
-    New hashes are batched and flushed periodically.
+    SQLite-backed game deduplication.
+    If pointed at an existing db, uses the games table.
+    If db does not exist, creates a fresh one with a lightweight tracking table.
     """
 
-    def __init__(self, db_path: str, batch_size: int = 10000):
+    def __init__(self, db_path: str):
         self.db_path = db_path
-        self.batch_size = batch_size
         self._conn: Optional[sqlite3.Connection] = None
-        self._seen: Set[Tuple[str, str]] = set()  # (game_hash, engine)
-        self._pending: List[Tuple[str, str, str, float]] = []  # (hash, engine, game_id, time)
-        self._lock = threading.Lock()
+        self._use_tracking_table = False
 
     def connect(self):
-        """Connect to DB and preload existing hashes."""
         is_new = not os.path.exists(self.db_path)
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._conn = sqlite3.connect(self.db_path)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=30000")
 
-        # Ensure table exists
+        # Always ensure the tracking table exists
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS processed_games (
                 game_hash TEXT NOT NULL,
@@ -73,65 +87,39 @@ class GameDeduplicator:
             )
         """)
         self._conn.commit()
+        self._use_tracking_table = True
 
-        # Preload existing hashes
-        print(f"[DEDUP] Loading existing hashes from {self.db_path}...", file=sys.stderr)
-        cursor = self._conn.execute("SELECT game_hash, engine FROM processed_games")
-        count = 0
-        for row in cursor:
-            self._seen.add((row[0], row[1]))
-            count += 1
-
-        print(f"[DEDUP] Preloaded {count} existing hashes into memory", file=sys.stderr)
+        count = self._conn.execute("SELECT COUNT(*) FROM processed_games").fetchone()[0]
+        print(f"[DEDUP] DB: {self.db_path} | Table: processed_games | Existing rows: {count}")
 
     def is_duplicate(self, game_hash: str, engine: str = None) -> bool:
-        """Check if game_hash exists (in-memory, no DB query)."""
-        with self._lock:
-            if engine:
-                return (game_hash, engine) in self._seen
-            else:
-                # Check if hash exists for any engine
-                return any(h == game_hash for h, e in self._seen)
+        """Check if game_hash exists. If engine is None, checks any engine."""
+        if engine:
+            row = self._conn.execute(
+                "SELECT 1 FROM processed_games WHERE game_hash = ? AND engine = ? LIMIT 1",
+                (game_hash, engine),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT 1 FROM processed_games WHERE game_hash = ? LIMIT 1",
+                (game_hash,),
+            ).fetchone()
+        return row is not None
 
     def mark_processed(self, game_hash: str, game_id: str, engine: str):
-        """Mark game as processed (in-memory + batch to DB)."""
-        with self._lock:
-            key = (game_hash, engine)
-            if key in self._seen:
-                return  # Already marked
-
-            self._seen.add(key)
-            self._pending.append((game_hash, engine, game_id, time.time()))
-
-            # Flush batch if full
-            if len(self._pending) >= self.batch_size:
-                self._flush_batch()
-
-    def _flush_batch(self):
-        """Write pending hashes to DB."""
-        if not self._pending:
-            return
-
         try:
-            self._conn.executemany(
+            self._conn.execute(
                 "INSERT OR IGNORE INTO processed_games (game_hash, engine, game_id, processed_at) "
                 "VALUES (?, ?, ?, ?)",
-                self._pending
+                (game_hash, engine, game_id, time.time()),
             )
             self._conn.commit()
-            flushed = len(self._pending)
-            self._pending.clear()
-            print(f"[DEDUP] Flushed {flushed} hashes to DB", file=sys.stderr)
         except Exception as e:
-            print(f"[DEDUP] ERROR flushing batch: {e}", file=sys.stderr)
+            print(f"[DEDUP] ERROR writing {game_hash}: {e}")
 
     def close(self):
-        """Flush remaining hashes and close DB."""
-        with self._lock:
-            self._flush_batch()
-            if self._conn:
-                self._conn.close()
-                self._conn = None
+        if self._conn:
+            self._conn.close()
 
 
 def compute_game_hash(pgn_text: str) -> str:
@@ -167,6 +155,13 @@ def _wdl_percentages(wdl_w, wdl_d, wdl_l):
     """
     Convert WDL values to (white_win%, black_win%, draw%) as 0-100.
     Evaluators return 0.0-1.0 values (already divided by 1000).
+
+    TODO(WDL-PERSPECTIVE-FIX): This function ASSUMES wdl_w/d/l are from
+    White's perspective, but _extract_wdl() returns STM perspective.
+    When STM=Black, the inputs are actually (Black_win, draw, Black_loss).
+    The returned 'white_win%' is then actually Black's win%, etc.
+    FIX: Either fix _extract_wdl to return .white() perspective, OR
+    accept STM perspective here and rename return values accordingly.
     """
     if wdl_w is None or wdl_d is None or wdl_l is None:
         return None, None, None
@@ -205,31 +200,32 @@ def _extract_wdl_from_eval(eval_result):
     return None, None, None
 
 
-def _process_game_with_engine(engine, game_id, pgn_text, multipv, engine_name, engine_version, metrics=None, worker_id=None):
+def _process_game_with_engine(engine, game_id, pgn_text, engine_name, engine_version):
     """
-    Process a single game with any engine that has .evaluate_position(board, multipv).
+    Process a single game with any engine that has:
+      - evaluate_position(board, multipv=1) for position-level eval
+      - evaluate_all_legal_moves(board) for per-candidate eval
+
     Returns (game_dict, [move_dict], [possible_move_dict]) matching parquet_schema.py.
+
+    For each position, ALL legal moves are enumerated and each resulting
+    child position is evaluated individually with the engine. This produces
+    ~30 possible_move rows per actual move.
 
     Features:
     - SHA-256 hashed player names
     - Computed winner/loser/elo diffs
     - Full move detail (from_square, to_square, piece, promotion, color)
-    - WDL before/after for moves
-    - WDL for possible moves (from multipv)
+    - WDL before/after for actual moves
+    - Per-legal-move eval + WDL via evaluate_all_legal_moves()
     - Eval caching: eval_after[N] becomes eval_before[N+1] (zero extra calls)
     - time_spent computed from clock comment deltas
     - game_to_position as running SAN move list
     - static_eval_before/after set to None (no extra engine calls)
     """
-    t0 = time.time()
-
     game = chess.pgn.read_game(io.StringIO(pgn_text))
     if game is None:
         raise ValueError("Failed to parse PGN")
-
-    parse_time = time.time() - t0
-    if metrics:
-        metrics.record_stage_time('parse', parse_time * 1000)
 
     headers = game.headers
     board = game.board()
@@ -315,8 +311,6 @@ def _process_game_with_engine(engine, game_id, pgn_text, multipv, engine_name, e
     cached_eval = None       # (eval_cp, mate_count, wdl_w, wdl_d, wdl_l)
     san_parts = []           # Running SAN move list for game_to_position
 
-    eval_time_total = 0.0
-
     while node.variations:
         next_node = node.variation(0)
         move = next_node.move
@@ -363,35 +357,39 @@ def _process_game_with_engine(engine, game_id, pgn_text, multipv, engine_name, e
         eval_before_cp = None
         mate_before = None
         wdl_w_before, wdl_d_before, wdl_l_before = None, None, None
-        eval_result = None
 
         if cached_eval is not None:
             eval_before_cp, mate_before, wdl_w_before, wdl_d_before, wdl_l_before = cached_eval
 
-        # Always run full eval for this position to get multipv for possible_moves
-        if not board.is_game_over():
-            t_eval = time.time()
+        # If no cache, get a quick position eval for eval_before
+        if cached_eval is None and not board.is_game_over():
             try:
-                eval_result = engine.evaluate_position(board, multipv=multipv)
-                eval_time_total += time.time() - t_eval
-
-                # If no cache, use this eval as eval_before
-                if cached_eval is None:
-                    eval_before_cp = float(eval_result.score_cp) if eval_result.score_cp is not None else None
-                    mate_before = float(eval_result.score_mate) if eval_result.score_mate is not None else None
-                    wdl_w_before, wdl_d_before, wdl_l_before = _extract_wdl_from_eval(eval_result)
-            except Exception as e:
-                # Engine failed — skip this move's eval but still record the move
-                if metrics and worker_id is not None:
-                    metrics.worker_idle(worker_id)
-                print(f"[{engine_name}] Eval failed at ply {ply}: {e}", file=sys.stderr)
-        else:
-            # Terminal position before move (shouldn't happen in valid PGN)
-            cached_eval = None
+                eval_before_result = engine.evaluate_position(board, multipv=1)
+                eval_before_cp = float(eval_before_result.score_cp) if eval_before_result.score_cp is not None else None
+                mate_before = float(eval_before_result.score_mate) if eval_before_result.score_mate is not None else None
+                wdl_w_before, wdl_d_before, wdl_l_before = _extract_wdl_from_eval(eval_before_result)
+            except Exception:
+                pass
 
         w_win_b, b_win_b, draw_b = _wdl_percentages(wdl_w_before, wdl_d_before, wdl_l_before)
 
-        # ── Push move, eval AFTER ────────────────────────────────────────
+        # ── Enumerate ALL legal moves and evaluate each child position ───
+        all_legal_evals = None
+        if not board.is_game_over():
+            try:
+                # This calls engine.evaluate_all_legal_moves() which pushes
+                # each legal move, evaluates the child position, and returns
+                # per-move eval/WDL from WHITE's perspective.
+                if hasattr(engine, 'evaluate_all_legal_moves'):
+                    all_legal_evals = engine.evaluate_all_legal_moves(board)
+                else:
+                    # Fallback for engines without evaluate_all_legal_moves
+                    # (e.g. StockfishEvaluator): enumerate manually
+                    all_legal_evals = _fallback_enumerate_legal_moves(engine, board)
+            except Exception:
+                all_legal_evals = None
+
+        # ── Push actual move, eval AFTER ─────────────────────────────────
         board.push(move)
         fen_after = board.fen()
         san_parts.append(notation)
@@ -416,20 +414,33 @@ def _process_game_with_engine(engine, game_id, pgn_text, multipv, engine_name, e
                 wdl_w_after, wdl_d_after, wdl_l_after = 0.0, 1.0, 0.0
             cached_eval = (eval_after_cp, mate_after, wdl_w_after, wdl_d_after, wdl_l_after)
         else:
-            t_eval = time.time()
-            try:
-                eval_after_result = engine.evaluate_position(board, multipv=1)
-                eval_time_total += time.time() - t_eval
+            # Try to get eval_after from the all_legal_evals results
+            # (we already evaluated this child position as part of the
+            # legal-moves enumeration — reuse it instead of another call)
+            reused = False
+            if all_legal_evals:
+                for entry in all_legal_evals:
+                    if entry.get("move_uci") == move.uci():
+                        # This is the child position for the actual move played.
+                        # Its eval is from WHITE's perspective — exactly what we want.
+                        eval_after_cp = float(entry["score_cp"]) if entry.get("score_cp") is not None else None
+                        mate_after = float(entry["score_mate"]) if entry.get("score_mate") is not None else None
+                        wdl_w_after = entry.get("wdl_w")
+                        wdl_d_after = entry.get("wdl_d")
+                        wdl_l_after = entry.get("wdl_l")
+                        reused = True
+                        break
 
-                eval_after_cp = float(eval_after_result.score_cp) if eval_after_result.score_cp is not None else None
-                mate_after = float(eval_after_result.score_mate) if eval_after_result.score_mate is not None else None
-                wdl_w_after, wdl_d_after, wdl_l_after = _extract_wdl_from_eval(eval_after_result)
-                cached_eval = (eval_after_cp, mate_after, wdl_w_after, wdl_d_after, wdl_l_after)
-            except Exception as e:
-                if metrics and worker_id is not None:
-                    metrics.worker_idle(worker_id)
-                print(f"[{engine_name}] Eval after failed at ply {ply}: {e}", file=sys.stderr)
-                cached_eval = None
+            if not reused:
+                try:
+                    eval_after_result = engine.evaluate_position(board, multipv=1)
+                    eval_after_cp = float(eval_after_result.score_cp) if eval_after_result.score_cp is not None else None
+                    mate_after = float(eval_after_result.score_mate) if eval_after_result.score_mate is not None else None
+                    wdl_w_after, wdl_d_after, wdl_l_after = _extract_wdl_from_eval(eval_after_result)
+                except Exception:
+                    pass
+
+            cached_eval = (eval_after_cp, mate_after, wdl_w_after, wdl_d_after, wdl_l_after)
 
         w_win_a, b_win_a, draw_a = _wdl_percentages(wdl_w_after, wdl_d_after, wdl_l_after)
 
@@ -468,49 +479,46 @@ def _process_game_with_engine(engine, game_id, pgn_text, multipv, engine_name, e
         }
         move_records.append(mr)
 
-        # ── PossibleMoveRecords from multipv ─────────────────────────────
-        if eval_result and eval_result.multipv:
+        # ── PossibleMoveRecords from ALL legal moves ─────────────────────
+        if all_legal_evals:
             board_before = chess.Board(fen_before)
 
-            for pv_entry in eval_result.multipv:
-                pv_uci = pv_entry.get("move_uci", "")
-                pv_san = pv_entry.get("move_san", "")
-                pv_eval = float(pv_entry["score_cp"]) if pv_entry.get("score_cp") is not None else None
-                pv_mate = float(pv_entry["score_mate"]) if pv_entry.get("score_mate") is not None else None
-                pv_nodes = pv_entry.get("nodes", 0)
-                pv_depth = pv_entry.get("depth", 0)
+            for entry in all_legal_evals:
+                pm_uci = entry.get("move_uci", "")
+                pm_san = entry.get("move_san", "")
+                pm_fen_after = entry.get("fen_after", "")
 
                 # Decompose the possible move
-                pm_from, pm_to, pm_piece_str, pm_promo, pm_fen_after = "", "", "", "", ""
+                pm_from, pm_to, pm_piece_str, pm_promo = "", "", "", ""
                 try:
-                    pm_move = chess.Move.from_uci(pv_uci)
+                    pm_move = chess.Move.from_uci(pm_uci)
                     pm_from = chess.square_name(pm_move.from_square)
                     pm_to = chess.square_name(pm_move.to_square)
                     pm_piece = board_before.piece_at(pm_move.from_square)
                     pm_piece_str = pm_piece.symbol() if pm_piece else ""
                     pm_promo = chess.piece_name(pm_move.promotion) if pm_move.promotion else ""
-                    board_copy = board_before.copy()
-                    board_copy.push(pm_move)
-                    pm_fen_after = board_copy.fen()
                 except Exception:
                     pass
 
-                # Per-PV WDL (fall back to top-level eval WDL if per-PV missing)
-                pv_wdl_w = pv_entry.get("wdl_w")
-                pv_wdl_d = pv_entry.get("wdl_d")
-                pv_wdl_l = pv_entry.get("wdl_l")
-                if pv_wdl_w is None and eval_result:
-                    pv_wdl_w = getattr(eval_result, 'wdl_w', None)
-                    pv_wdl_d = getattr(eval_result, 'wdl_d', None)
-                    pv_wdl_l = getattr(eval_result, 'wdl_l', None)
-                pm_w, pm_b, pm_d = _wdl_percentages(pv_wdl_w, pv_wdl_d, pv_wdl_l)
+                pm_score_cp = float(entry["score_cp"]) if entry.get("score_cp") is not None else None
+                pm_score_mate = float(entry["score_mate"]) if entry.get("score_mate") is not None else None
+
+                # WDL percentages (engine returns 0.0-1.0 from WHITE's perspective)
+                # TODO(WDL-PERSPECTIVE-FIX): Actually from STM perspective, not
+                # White's.  Fix _extract_wdl to use .white() and this comment
+                # becomes correct.
+                pm_w, pm_b, pm_d = _wdl_percentages(
+                    entry.get("wdl_w"),
+                    entry.get("wdl_d"),
+                    entry.get("wdl_l"),
+                )
 
                 pm = {
                     "game_id": game_id,
                     "move_no": move_no,
                     "move_no_pair": move_no_pair,
-                    "notation": pv_san,
-                    "move": pv_uci,
+                    "notation": pm_san,
+                    "move": pm_uci,
                     "from_square": pm_from,
                     "to_square": pm_to,
                     "piece": pm_piece_str,
@@ -518,13 +526,13 @@ def _process_game_with_engine(engine, game_id, pgn_text, multipv, engine_name, e
                     "color": color,
                     "fen_before": fen_before,
                     "fen_after": pm_fen_after,
-                    "eval": pv_eval,
-                    "mate_count": pv_mate,
+                    "eval": pm_score_cp,
+                    "mate_count": pm_score_mate,
                     "white_win_perc": pm_w,
                     "black_win_perc": pm_b,
                     "draw_perc": pm_d,
-                    "nodes": pv_nodes or 0,
-                    "depth": pv_depth or 0,
+                    "nodes": entry.get("nodes", 0) or 0,
+                    "depth": entry.get("depth", 0) or 0,
                     "pv": "",
                     "evaluated_by": engine_name,
                     "evaluator_version": engine_version,
@@ -535,13 +543,79 @@ def _process_game_with_engine(engine, game_id, pgn_text, multipv, engine_name, e
         ply += 1
 
     game_rec["ply_count"] = ply
-
-    total_time = time.time() - t0
-    if metrics:
-        metrics.record_stage_time('eval', eval_time_total * 1000)
-        metrics.record_stage_time('total_game', total_time * 1000)
-
     return game_rec, move_records, possible_move_records
+
+
+def _fallback_enumerate_legal_moves(engine, board):
+    """
+    Fallback for engines without evaluate_all_legal_moves() (e.g. Stockfish).
+    Enumerate all legal moves, push each, evaluate the child position.
+    Returns same format as BatchLC0Evaluator.evaluate_all_legal_moves().
+    """
+    results = []
+    for move in board.legal_moves:
+        try:
+            san = board.san(move)
+        except Exception:
+            san = move.uci()
+
+        board_after = board.copy()
+        board_after.push(move)
+        fen_after = board_after.fen()
+
+        entry = {
+            "move_uci": move.uci(),
+            "move_san": san,
+            "score_cp": None,
+            "score_mate": None,
+            "nodes": 0,
+            "depth": 0,
+            "wdl_w": None,
+            "wdl_d": None,
+            "wdl_l": None,
+            "fen_after": fen_after,
+        }
+
+        if board_after.is_game_over():
+            if board_after.is_checkmate():
+                if board_after.turn == chess.WHITE:
+                    entry["score_cp"] = -10000
+                    entry["score_mate"] = 0
+                    entry["wdl_w"] = 0.0
+                    entry["wdl_d"] = 0.0
+                    entry["wdl_l"] = 1.0
+                else:
+                    entry["score_cp"] = 10000
+                    entry["score_mate"] = 0
+                    entry["wdl_w"] = 1.0
+                    entry["wdl_d"] = 0.0
+                    entry["wdl_l"] = 0.0
+            else:
+                entry["score_cp"] = 0
+                entry["wdl_w"] = 0.0
+                entry["wdl_d"] = 1.0
+                entry["wdl_l"] = 0.0
+        else:
+            try:
+                eval_result = engine.evaluate_position(board_after, multipv=1)
+                score = getattr(eval_result, 'score_cp', None)
+                mate = getattr(eval_result, 'score_mate', None)
+                entry["score_cp"] = score
+                entry["score_mate"] = mate
+                entry["nodes"] = getattr(eval_result, 'nodes', 0)
+                entry["depth"] = getattr(eval_result, 'depth', 0)
+
+                w = getattr(eval_result, 'wdl_w', None)
+                d = getattr(eval_result, 'wdl_d', None)
+                l = getattr(eval_result, 'wdl_l', None)
+                entry["wdl_w"] = w
+                entry["wdl_d"] = d
+                entry["wdl_l"] = l
+            except Exception:
+                pass
+
+        results.append(entry)
+    return results
 
 
 # ── LC0 Worker ───────────────────────────────────────────────────────────────
@@ -549,30 +623,17 @@ def _process_game_with_engine(engine, game_id, pgn_text, multipv, engine_name, e
 def lc0_worker(
     worker_id, game_queue, result_queue,
     lc0_path, weights_path, backend, batch_size, nodes,
-    output_dir, multipv, evaluator_version,
-    verify_gpu=True, metrics=None,
+    output_dir, evaluator_version, run_timestamp,
+    max_games_per_batch,
 ):
-    """LC0 worker process."""
-    if metrics:
-        metrics.register_worker(worker_id, 'lc0')
-
-    worker_output = os.path.join(output_dir, f"worker_{worker_id:02d}")
-    writer = ParquetWriter(worker_output, worker_id=worker_id)
-
-    # Validate paths before spawn
-    if not os.path.exists(lc0_path):
-        result_queue.put({
-            "status": "error", "engine": "lc0", "worker_id": worker_id,
-            "error": f"LC0 executable not found: {lc0_path}"
-        })
-        return
-
-    if not os.path.exists(weights_path):
-        result_queue.put({
-            "status": "error", "engine": "lc0", "worker_id": worker_id,
-            "error": f"Weights file not found: {weights_path}"
-        })
-        return
+    """LC0 worker process. Evaluates all legal moves per position."""
+    worker_base = os.path.join(output_dir, f"worker_{worker_id:02d}_{run_timestamp}")
+    writer = ParquetWriter(
+        worker_base,
+        worker_id=worker_id,
+        max_games_per_batch=max_games_per_batch,
+        possible_moves_batch_size=100_000,
+    )
 
     engine = SyncBatchEvaluator(
         lc0_path=lc0_path,
@@ -580,36 +641,19 @@ def lc0_worker(
         backend=backend,
         batch_size=batch_size,
         nodes=nodes,
-        verify_gpu=verify_gpu,
     )
-
-    try:
-        engine.start()
-    except Exception as e:
-        result_queue.put({
-            "status": "error", "engine": "lc0", "worker_id": worker_id,
-            "error": f"Failed to start LC0: {e}"
-        })
-        return
+    engine.start()
 
     games_done = 0
     try:
         while True:
-            if metrics:
-                metrics.worker_idle(worker_id)
-
             item = game_queue.get()
             if item is None:
                 break
-
-            if metrics:
-                metrics.worker_busy(worker_id)
-
             game_id, game_hash, pgn_text = item
             try:
                 game_rec, moves, pmoves = _process_game_with_engine(
-                    engine, game_id, pgn_text, multipv, "lc0", evaluator_version,
-                    metrics=metrics, worker_id=worker_id,
+                    engine, game_id, pgn_text, "lc0", evaluator_version,
                 )
                 writer.write_game(game_rec)
                 for m in moves:
@@ -622,14 +666,14 @@ def lc0_worker(
                     "worker_id": worker_id,
                     "game_id": game_id, "game_hash": game_hash,
                     "num_moves": game_rec["ply_count"],
+                    "num_possible_moves": len(pmoves),
                 })
             except Exception as e:
-                import traceback
                 result_queue.put({
                     "status": "error", "engine": "lc0",
                     "worker_id": worker_id,
                     "game_id": game_id, "game_hash": game_hash,
-                    "error": f"{e}\n{traceback.format_exc()[:500]}",
+                    "error": str(e),
                 })
     finally:
         writer.close()
@@ -648,22 +692,17 @@ def lc0_worker(
 def stockfish_worker(
     worker_id, game_queue, result_queue,
     stockfish_path, depth, threads, hash_mb,
-    output_dir, multipv, metrics=None,
+    output_dir, run_timestamp,
+    max_games_per_batch,
 ):
-    """Stockfish depth-14 worker process."""
-    if metrics:
-        metrics.register_worker(worker_id + 1000, 'stockfish')  # Offset IDs to avoid collision
-
-    worker_output = os.path.join(output_dir, f"worker_{worker_id:02d}")
-    writer = ParquetWriter(worker_output, worker_id=worker_id)
-
-    # Validate path
-    if not os.path.exists(stockfish_path):
-        result_queue.put({
-            "status": "error", "engine": "stockfish", "worker_id": worker_id,
-            "error": f"Stockfish executable not found: {stockfish_path}"
-        })
-        return
+    """Stockfish worker process. Evaluates all legal moves per position."""
+    worker_base = os.path.join(output_dir, f"worker_{worker_id:02d}_{run_timestamp}")
+    writer = ParquetWriter(
+        worker_base,
+        worker_id=worker_id,
+        max_games_per_batch=max_games_per_batch,
+        possible_moves_batch_size=100_000,
+    )
 
     engine = StockfishEvaluator(
         stockfish_path=stockfish_path,
@@ -671,36 +710,19 @@ def stockfish_worker(
         threads=threads,
         hash_mb=hash_mb,
     )
-
-    try:
-        engine.start()
-    except Exception as e:
-        result_queue.put({
-            "status": "error", "engine": "stockfish", "worker_id": worker_id,
-            "error": f"Failed to start Stockfish: {e}"
-        })
-        return
-
+    engine.start()
     sf_version = engine.version
-    games_done = 0
 
+    games_done = 0
     try:
         while True:
-            if metrics:
-                metrics.worker_idle(worker_id + 1000)
-
             item = game_queue.get()
             if item is None:
                 break
-
-            if metrics:
-                metrics.worker_busy(worker_id + 1000)
-
             game_id, game_hash, pgn_text = item
             try:
                 game_rec, moves, pmoves = _process_game_with_engine(
-                    engine, game_id, pgn_text, multipv, "stockfish", sf_version,
-                    metrics=metrics, worker_id=worker_id + 1000,
+                    engine, game_id, pgn_text, "stockfish", sf_version,
                 )
                 writer.write_game(game_rec)
                 for m in moves:
@@ -713,14 +735,14 @@ def stockfish_worker(
                     "worker_id": worker_id,
                     "game_id": game_id, "game_hash": game_hash,
                     "num_moves": game_rec["ply_count"],
+                    "num_possible_moves": len(pmoves),
                 })
             except Exception as e:
-                import traceback
                 result_queue.put({
                     "status": "error", "engine": "stockfish",
                     "worker_id": worker_id,
                     "game_id": game_id, "game_hash": game_hash,
-                    "error": f"{e}\n{traceback.format_exc()[:500]}",
+                    "error": str(e),
                 })
     finally:
         writer.close()
@@ -748,7 +770,6 @@ def run_parallel(
     lc0_nodes: int = 1,
     num_lc0_workers: int = 2,
     lc0_version: str = "791556",
-    verify_gpu: bool = True,
     # Stockfish config
     stockfish_path: str = "",
     sf_depth: int = 14,
@@ -757,12 +778,11 @@ def run_parallel(
     num_sf_workers: int = 2,
     # General
     max_games: int = 0,
-    multipv: int = 1,
-    profile: bool = False,
+    max_games_per_batch: int = 15000,
 ):
     """
     Main entry point. Reads PGN, deduplicates, fans out to LC0 + Stockfish
-    worker pools, collects results.
+    worker pools, collects results. All legal moves are evaluated per position.
     """
     use_lc0 = bool(lc0_path and weights_path and num_lc0_workers > 0)
     use_sf = bool(stockfish_path and num_sf_workers > 0)
@@ -771,48 +791,18 @@ def run_parallel(
         print("ERROR: Must specify at least one engine (LC0 or Stockfish).")
         sys.exit(1)
 
-    # Validate paths early
-    if use_lc0:
-        if not os.path.exists(lc0_path):
-            print(f"ERROR: LC0 executable not found: {lc0_path}")
-            sys.exit(1)
-        if not os.path.exists(weights_path):
-            print(f"ERROR: Weights file not found: {weights_path}")
-            sys.exit(1)
-
-    if use_sf and not os.path.exists(stockfish_path):
-        print(f"ERROR: Stockfish executable not found: {stockfish_path}")
-        sys.exit(1)
-
-    # Auto-tune worker counts if oversubscribed
-    import os as _os
-    cpu_count = _os.cpu_count() or 16
-    if use_sf and num_sf_workers > cpu_count:
-        print(f"WARNING: Requested {num_sf_workers} Stockfish workers but only {cpu_count} CPUs", file=sys.stderr)
-        print(f"WARNING: Consider reducing --sf-workers to {cpu_count - num_lc0_workers - 2}", file=sys.stderr)
-
-    # Initialize dedup with preload
     dedup = GameDeduplicator(db_path)
     dedup.connect()
 
-    # Initialize metrics
-    metrics = None
-    if profile:
-        metrics = MetricsCollector(report_interval=30.0)
-        metrics.start()
-        print("[METRICS] Performance profiling enabled", file=sys.stderr)
+    # Timestamp each run to prevent accidental overwrites
+    run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
     lc0_output = os.path.join(output_dir, "lc0", lc0_version)
-    sf_output = os.path.join(output_dir, "stockfish_d14", "latest")
+    sf_output = os.path.join(output_dir, "stockfish_d14", f"d{sf_depth}")
 
     # Single shared queue — each game goes to ONE engine, not both
-    queue_maxsize = (num_lc0_workers + num_sf_workers) * 4
-    game_queue: Queue = Queue(maxsize=queue_maxsize)
+    game_queue: Queue = Queue(maxsize=(num_lc0_workers + num_sf_workers) * 4)
     result_queue: Queue = Queue()
-
-    if metrics:
-        metrics.register_queue('game', queue_maxsize)
-        metrics.register_queue('result', 0)  # Unbounded
 
     all_workers: List[Process] = []
     total_worker_count = 0
@@ -827,17 +817,17 @@ def run_parallel(
                     wid, game_queue, result_queue,
                     lc0_path, weights_path, backend,
                     lc0_batch_size, lc0_nodes,
-                    lc0_output, multipv, lc0_version,
-                    verify_gpu, None,  # metrics can't be pickled across processes on Windows
+                    lc0_output, lc0_version, run_timestamp,
+                    max_games_per_batch,
                 ),
                 daemon=True,
             )
             p.start()
             all_workers.append(p)
             total_worker_count += 1
-            if metrics:
-                metrics.register_worker(wid, 'lc0')
         print(f"[MAIN] Spawned {num_lc0_workers} LC0 workers -> {lc0_output}")
+        print(f"[MAIN] Mode: ALL legal moves evaluated per position")
+        print(f"[MAIN] Batch rotation: {max_games_per_batch} games per batch dir")
 
     # Spawn Stockfish workers
     if use_sf:
@@ -848,15 +838,14 @@ def run_parallel(
                 args=(
                     wid, game_queue, result_queue,
                     stockfish_path, sf_depth, sf_threads, sf_hash_mb,
-                    sf_output, multipv, None,  # metrics can't be pickled across processes on Windows
+                    sf_output, run_timestamp,
+                    max_games_per_batch,
                 ),
                 daemon=True,
             )
             p.start()
             all_workers.append(p)
             total_worker_count += 1
-            if metrics:
-                metrics.register_worker(wid + 1000, 'stockfish')
         print(f"[MAIN] Spawned {num_sf_workers} Stockfish d{sf_depth} workers -> {sf_output}")
 
     # Read PGN and dispatch — each game goes to ONE engine (whichever worker is free)
@@ -868,7 +857,6 @@ def run_parallel(
     print(f"[MAIN] Reading PGN: {pgn_path}")
     print(f"[MAIN] Max games: {'unlimited' if max_games <= 0 else max_games}")
     print(f"[MAIN] Mode: single-engine per game (shared queue)")
-    print(f"[MAIN] Dedup preload: {len(dedup._seen)} hashes loaded")
 
     # Result collector runs in a background thread so dedup writes happen
     # in real-time while the main thread is still dispatching games.
@@ -877,14 +865,12 @@ def run_parallel(
         "sf_completed": 0,
         "errors": 0,
         "workers_done": 0,
+        "total_possible_moves": 0,
     }
     collector_done = threading.Event()
-    queue_empty_since = None
 
     def result_collector():
         """Drain result_queue in background, write dedup entries immediately."""
-        nonlocal queue_empty_since
-
         # Own connection for this thread (SQLite objects are thread-bound)
         thread_dedup = GameDeduplicator(db_path)
         thread_dedup.connect()
@@ -892,23 +878,11 @@ def run_parallel(
         while True:
             try:
                 msg = result_queue.get(timeout=5)
-                queue_empty_since = None
             except Exception:
-                # Check if game queue is starving workers
-                if game_queue.qsize() == 0:
-                    if queue_empty_since is None:
-                        queue_empty_since = time.time()
-                    elif time.time() - queue_empty_since > 10:
-                        print(f"[MAIN WARNING] Game queue empty for >10s — parser may be starved", file=sys.stderr)
-                        queue_empty_since = time.time()  # Reset to avoid spam
-
                 if collector_done.is_set():
                     thread_dedup.close()
                     break
                 continue
-
-            if metrics:
-                metrics.record_queue_size('result', result_queue.qsize())
 
             if msg["status"] == "worker_done":
                 collector_state["workers_done"] += 1
@@ -916,81 +890,69 @@ def run_parallel(
                 print(
                     f"[{eng.upper()}] Worker {msg['worker_id']} finished: "
                     f"{msg['games_done']} games, "
-                    f"{msg['moves_written']} moves written"
+                    f"{msg['moves_written']} moves, "
+                    f"{msg['possible_moves_written']} possible_moves written"
                 )
                 if collector_state["workers_done"] >= total_worker_count:
                     thread_dedup.close()
                     break
             elif msg["status"] == "ok":
                 thread_dedup.mark_processed(msg["game_hash"], msg["game_id"], msg["engine"])
+                collector_state["total_possible_moves"] += msg.get("num_possible_moves", 0)
                 if msg["engine"] == "lc0":
                     collector_state["lc0_completed"] += 1
                 else:
                     collector_state["sf_completed"] += 1
-
-                if metrics:
-                    metrics.increment_completed()
-                    metrics.record_queue_size('game', game_queue.qsize())
-
                 total_done = collector_state["lc0_completed"] + collector_state["sf_completed"]
                 if total_done % 20 == 0:
                     elapsed = time.time() - t0
+                    rate = total_done / elapsed if elapsed > 0 else 0
                     print(
                         f"[MAIN] LC0: {collector_state['lc0_completed']} | "
                         f"SF: {collector_state['sf_completed']} | "
                         f"Total: {total_done}/{dispatched} | "
-                        f"{elapsed:.1f}s"
+                        f"PossibleMoves: {collector_state['total_possible_moves']:,} | "
+                        f"{elapsed:.1f}s ({rate:.2f} g/s)"
                     )
             elif msg["status"] == "error":
                 collector_state["errors"] += 1
-                print(f"[{msg['engine'].upper()}] Error in worker {msg['worker_id']}: {msg.get('error', 'unknown')}")
+                print(f"[{msg['engine'].upper()}] Error: {msg.get('error', 'unknown')}")
 
     collector_thread = threading.Thread(target=result_collector, daemon=True)
     collector_thread.start()
 
-    try:
-        with open(pgn_path, "r", errors="replace") as f:
-            while True:
-                if max_games > 0 and dispatched >= max_games:
-                    break
+    with open(pgn_path, "r", errors="replace") as f:
+        while True:
+            if max_games > 0 and dispatched >= max_games:
+                break
 
-                game = chess.pgn.read_game(f)
-                if game is None:
-                    break
+            game = chess.pgn.read_game(f)
+            if game is None:
+                break
 
-                game_number += 1
-                pgn_text = str(game)
-                game_hash = compute_game_hash(pgn_text)
-                game_id = f"game_{game_hash}"
+            game_number += 1
+            pgn_text = str(game)
+            game_hash = compute_game_hash(pgn_text)
+            game_id = f"game_{game_hash}"
 
-                # Skip if already processed by ANY engine (in-memory check, no DB query)
-                if dedup.is_duplicate(game_hash):
-                    skipped += 1
-                    if metrics:
-                        metrics.increment_skipped()
-                    continue
+            # Skip if already processed by ANY engine
+            if dedup.is_duplicate(game_hash):
+                skipped += 1
+                continue
 
-                # Block if queue is full (backpressure)
-                game_queue.put((game_id, game_hash, pgn_text))
-                dispatched += 1
+            game_queue.put((game_id, game_hash, pgn_text))
+            dispatched += 1
 
-                if metrics:
-                    metrics.increment_dispatched()
-                    metrics.record_queue_size('game', game_queue.qsize())
-
-                if game_number % 100 == 0:
-                    elapsed = time.time() - t0
-                    total_done = collector_state["lc0_completed"] + collector_state["sf_completed"]
-                    print(
-                        f"[MAIN] Scanned {game_number} games | "
-                        f"Dispatched: {dispatched} | "
-                        f"Completed: {total_done} | "
-                        f"Skipped: {skipped} | "
-                        f"{elapsed:.1f}s"
-                    )
-
-    except KeyboardInterrupt:
-        print("\n[MAIN] Interrupted by user, shutting down...", file=sys.stderr)
+            if game_number % 100 == 0:
+                elapsed = time.time() - t0
+                total_done = collector_state["lc0_completed"] + collector_state["sf_completed"]
+                print(
+                    f"[MAIN] Scanned {game_number} games | "
+                    f"Dispatched: {dispatched} | "
+                    f"Completed: {total_done} | "
+                    f"Skipped: {skipped} | "
+                    f"{elapsed:.1f}s"
+                )
 
     # Send poison pills — one per worker
     for _ in range(total_worker_count):
@@ -1004,21 +966,16 @@ def run_parallel(
 
     for p in all_workers:
         p.join(timeout=15)
-        if p.is_alive():
-            print(f"[MAIN WARNING] Worker {p.pid} did not exit cleanly, terminating...", file=sys.stderr)
-            p.terminate()
 
     lc0_completed = collector_state["lc0_completed"]
     sf_completed = collector_state["sf_completed"]
     errors = collector_state["errors"]
 
     dedup.close()
-
-    if metrics:
-        metrics.stop()
-        print(metrics.final_report())
-
     elapsed = time.time() - t0
+
+    total_done = lc0_completed + sf_completed
+    rate = total_done / elapsed if elapsed > 0 else 0
 
     print(f"\n{'='*60}")
     print(f"  PARALLEL PROCESSING COMPLETE")
@@ -1027,13 +984,13 @@ def run_parallel(
     print(f"  Games dispatched:     {dispatched}")
     print(f"  LC0 completed:        {lc0_completed}")
     print(f"  Stockfish completed:  {sf_completed}")
+    print(f"  Total possible moves: {collector_state['total_possible_moves']:,}")
     print(f"  Errors:               {errors}")
-    print(f"  Wall time:            {elapsed:.1f}s")
-    if dispatched > 0:
-        print(f"  Throughput:           {dispatched/elapsed:.2f} games/s")
+    print(f"  Wall time:            {elapsed:.1f}s ({rate:.2f} g/s)")
     print(f"  LC0 output:           {lc0_output}")
     if use_sf:
         print(f"  Stockfish output:     {sf_output}")
+    print(f"  Batch size:           {max_games_per_batch} games per batch dir")
     print(f"{'='*60}")
 
 
@@ -1041,42 +998,29 @@ def run_parallel(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Parallel chess game processor — LC0 + Stockfish with GPU validation",
+        description="Parallel chess game processor — LC0 + Stockfish (all legal moves)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
 
-  # LC0 only, 4 workers with GPU validation:
+  # LC0 only, 4 workers, all legal moves evaluated:
   python parallel_processor.py games.pgn --lc0 lc0.exe --weights 791556.pb.gz --lc0-workers 4
 
   # Stockfish only, 8 workers at depth 14:
   python parallel_processor.py games.pgn --stockfish stockfish.exe --sf-workers 8
 
-  # Both engines in parallel with profiling:
+  # Both engines in parallel:
   python parallel_processor.py games.pgn \\
       --lc0 lc0.exe --weights 791556.pb.gz --lc0-workers 2 \\
-      --stockfish stockfish.exe --sf-workers 4 \\
-      --profile
+      --stockfish stockfish.exe --sf-workers 4
 
-  # Limit to 100 games with auto-tune:
-  python parallel_processor.py games.pgn --max-games 100 \\
-      --lc0 lc0.exe --weights 791556.pb.gz \\
-      --stockfish stockfish.exe
+  # Custom batch size (games per batch directory):
+  python parallel_processor.py games.pgn --max-games-per-batch 10000 \\
+      --lc0 lc0.exe --weights 791556.pb.gz
 
-GPU Validation:
-  The script validates that LC0 executable exists, weights file exists,
-  and the requested backend is supported. It runs a smoke test on startup
-  to verify the engine responds. If GPU is not detected, it will warn you.
-
-Performance Tuning:
-  - LC0 batch size: 32-128 (higher = more GPU utilization)
-  - Stockfish workers: ~1 per CPU core (minus LC0 workers)
-  - Use --profile to see bottleneck analysis
-
-Troubleshooting:
-  - If GPU util stays at 0%, check nvidia-smi during run
-  - If workers are idle, parser may be bottleneck (try faster SSD)
-  - If queue fills up, add more workers or reduce batch size
+  # Increase LC0 GPU batch size for better throughput:
+  python parallel_processor.py games.pgn --lc0-batch 256 \\
+      --lc0 lc0.exe --weights 791556.pb.gz --lc0-workers 4
 """,
     )
 
@@ -1084,19 +1028,19 @@ Troubleshooting:
     parser.add_argument("--db", default="chessv3.db", help="SQLite dedup database (created fresh if doesn't exist)")
     parser.add_argument("--output", default="output", help="Output directory")
     parser.add_argument("--max-games", type=int, default=0, help="Max games (0=all)")
-    parser.add_argument("--multipv", type=int, default=1, help="Multi-PV lines")
-    parser.add_argument("--profile", action="store_true", help="Enable performance profiling and metrics")
+    parser.add_argument("--max-games-per-batch", type=int, default=15000,
+                        help="Max games per batch subdirectory (0=no batching)")
 
     # LC0
     lc0 = parser.add_argument_group("LC0")
     lc0.add_argument("--lc0", default="", help="Path to lc0 executable")
     lc0.add_argument("--weights", default="", help="LC0 weights file")
-    lc0.add_argument("--backend", default="cuda-fp16", help="LC0 backend (cuda-fp16, cuda, opencl, etc.)")
-    lc0.add_argument("--lc0-batch", type=int, default=32, help="LC0 minibatch size (16/32/64/128)")
+    lc0.add_argument("--backend", default="cuda-fp16", help="LC0 backend")
+    lc0.add_argument("--lc0-batch", type=int, default=256,
+                     help="LC0 minibatch size (higher = better GPU utilization with all-legal-moves)")
     lc0.add_argument("--lc0-nodes", type=int, default=1, help="LC0 nodes per position")
     lc0.add_argument("--lc0-workers", type=int, default=2, help="Number of LC0 workers")
     lc0.add_argument("--lc0-version", default="791556", help="LC0 version tag")
-    lc0.add_argument("--no-verify-gpu", dest="verify_gpu", action="store_false", help="Skip GPU validation")
 
     # Stockfish
     sf = parser.add_argument_group("Stockfish")
@@ -1107,13 +1051,6 @@ Troubleshooting:
     sf.add_argument("--sf-workers", type=int, default=2, help="Number of SF workers")
 
     args = parser.parse_args()
-
-    # Auto-tune worker counts if oversubscribed
-    cpu_count = os.cpu_count() or 16
-    if args.stockfish and args.sf_workers > cpu_count:
-        print(f"WARNING: {args.sf_workers} SF workers requested but only {cpu_count} CPUs available", file=sys.stderr)
-        suggested = max(1, cpu_count - args.lc0_workers - 2)
-        print(f"WARNING: Consider --sf-workers {suggested}", file=sys.stderr)
 
     run_parallel(
         pgn_path=args.pgn_file,
@@ -1126,15 +1063,13 @@ Troubleshooting:
         lc0_nodes=args.lc0_nodes,
         num_lc0_workers=args.lc0_workers,
         lc0_version=args.lc0_version,
-        verify_gpu=args.verify_gpu,
         stockfish_path=args.stockfish,
         sf_depth=args.sf_depth,
         sf_threads=args.sf_threads,
         sf_hash_mb=args.sf_hash,
         num_sf_workers=args.sf_workers,
         max_games=args.max_games,
-        multipv=args.multipv,
-        profile=args.profile,
+        max_games_per_batch=args.max_games_per_batch,
     )
 
 

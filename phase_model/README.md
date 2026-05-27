@@ -1,7 +1,12 @@
-# MIMO — Chess Behaviour Prediction Model
+# MIMO with Phase — Chess Behaviour Prediction Model
 
 **Multi-Input Multi-Output** model predicting human chess behaviour from
-board position, candidate moves, and game context.
+board position, candidate moves, game context, **and game phase**.
+
+This is the **with_phase** variant. The only difference from base
+`mimo` is the addition of a learned game-phase embedding
+(opening / middlegame / endgame) that is concatenated into the context
+before cross-attention and fusion.
 
 ---
 
@@ -10,7 +15,7 @@ board position, candidate moves, and game context.
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  current_planes (B,47,8,8)   tabular (B,10)   possible_planes (B,M,47,8,8)
-│                                                possible_scalars (B,M,6)
+│                              game_phase (B,)    possible_scalars (B,M,6)
 └────────┬───────────────────────┬────────────────────┬────────────────┘
          │                       │                    │
   ┌──────▼──────┐      ┌────────▼────────┐   ┌──────▼──────┐
@@ -21,15 +26,20 @@ board position, candidate moves, and game context.
   │  → 128-dim   │      └────────┬────────┘   │  → 160→256   │
   └──────┬───────┘               │            └──────┬───────┘
          │                       │                   │
+         │              ┌────────▼────────┐          │
+         │              │ Phase Embedding │          │
+         │              │ nn.Emb(3,16)   │          │
+         │              └────────┬────────┘          │
+         │                       │                   │
          └───────────┬───────────┘                   │
                      │                               │
             ┌────────▼────────┐              ┌───────▼───────┐
-            │ Context (192-d) │──── query ──▶│Cross-Attention│
+            │ Context (208-d) │──── query ──▶│Cross-Attention│
             └────────┬────────┘              │ 4 heads       │
                      │                       └───────┬───────┘
                      │                               │
             ┌────────▼───────────────────────────────▼────────┐
-            │         Fusion MLP (448 → 256)                  │
+            │         Fusion MLP (464 → 256)                  │
             │         2 layers, LayerNorm, GELU, dropout 0.2  │
             └────────┬────────────────────────────────────────┘
                      │ global_hidden (256-d)
@@ -230,3 +240,53 @@ Built for the Parquet schema in `parquet_schema.py`:
 All three tables include `evaluated_by` and `evaluator_version` for engine filtering.
 
 Plane encoding: 47 planes from `plane_codec.py` (current + 2-history positions).
+
+---
+
+## Game-Phase Embedding (with_phase only)
+
+### What it is
+
+A learned 16-dimensional embedding that encodes the phase of the game:
+- **0 = Opening**: move_no ≤ 12 AND ≥ 12 minor/major pieces on board
+- **1 = Middlegame**: everything else
+- **2 = Endgame**: ≤ 6 minor/major pieces on board (regardless of move number)
+
+### Why it helps
+
+Humans play very differently across phases:
+- **Opening**: Book moves, fast play, pattern matching
+- **Middlegame**: Deep calculation, longer thinks, more mistakes at lower Elo
+- **Endgame**: Technique-driven, different piece valuations, time pressure effects
+
+A learned embedding lets the model capture these behavioral shifts without
+hard-coding assumptions about how phases affect each head.
+
+### How phase is classified
+
+```python
+def classify_game_phase(fen: str, move_no: int) -> int:
+    piece_part = fen.split()[0]
+    minor_major = sum(1 for c in piece_part if c in 'nbrqNBRQ')
+    if move_no <= 12 and minor_major >= 12:
+        return 0   # opening
+    elif minor_major <= 6:
+        return 2   # endgame
+    else:
+        return 1   # middlegame
+```
+
+Uses piece count from FEN (available via `fen_before`) rather than just move
+number, so it correctly identifies early endgames from exchanges.
+
+### Architecture integration
+
+- `nn.Embedding(3, 16)` → 48 extra parameters (negligible)
+- Concatenated with board_emb + tabular_emb before cross-attention query
+- Also included in fusion: board (128) + tabular (64) + **phase (16)** + attn (256) = 464
+- Backward compatible: if `game_phase=None` is passed, defaults to middlegame (1)
+
+### Difference from base mimo
+
+This is the **only** difference. All other architecture, masking, features,
+and training logic are identical to `mimo`.
