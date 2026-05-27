@@ -38,7 +38,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from chess_mimo_model_v4 import ChessMIMOModelV4
-from mimo_dataset_polars import MIMOCompactDataset, dynamic_collate
+from mimo_dataset_polars import MIMOCompactDataset
 
 # Optional sklearn / matplotlib
 try:
@@ -423,7 +423,6 @@ def main():
                         num_workers=args.num_workers, pin_memory=False,
                         prefetch_factor=2 if args.num_workers > 0 else None,
                         persistent_workers=args.num_workers > 0,
-                        collate_fn=dynamic_collate)
     print(f"[DATA] {len(ds):,} examples → {len(loader):,} batches")
 
     # Run

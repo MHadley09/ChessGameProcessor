@@ -67,8 +67,7 @@ Architecture overview:
 Masking strategy (same as V1):
     - move_logits: sees all possible moves, picks which one human played
     - mistake_prob: sees position + candidates, NOT which was played or result
-    - win_prob_before: actual move NOT explicitly identified
-    - win_prob_after: sees actual move embedding
+    - win_prob_before: game outcome from White's perspective (always)
     - time_spent: time_spent excluded from tabular features
 
 Author: Sskeer
@@ -439,16 +438,7 @@ class ChessMIMOModelV3(nn.Module):
             nn.Linear(hidden_dim // 2, 3),
         )
 
-        # 4. Win prob after (WDL, 3-way)
-        #    Input: global_hidden (256) + actual_move_emb (256) = 512
-        self.wdl_after_head = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 3),
-        )
-
-        # 5. Time spent (log-scale scalar)
+        # 4. Time spent (log-scale scalar)
         self.time_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
@@ -518,7 +508,6 @@ class ChessMIMOModelV3(nn.Module):
             move_logits     (B, M)
             mistake_prob    (B, 1)
             win_prob_before (B, 3)
-            win_prob_after  (B, 3)   — only if actual_idx provided
             time_spent      (B, 1)
         """
         B = current_planes.shape[0]
@@ -588,16 +577,6 @@ class ChessMIMOModelV3(nn.Module):
 
         # ============================================================
         # WDL AFTER (sees actual move)
-        # ============================================================
-        if actual_idx is not None:
-            safe_aidx = actual_idx.clamp(min=0)
-            idx_exp = safe_aidx.unsqueeze(-1).expand(-1, self.hidden_dim)
-            actual_move_emb = move_emb.gather(1, idx_exp.unsqueeze(1)).squeeze(1)
-            wdl_after_input = torch.cat([global_hidden, actual_move_emb], dim=-1)
-            outputs['win_prob_after'] = F.softmax(
-                self.wdl_after_head(wdl_after_input), dim=-1
-            )
-
         return outputs
 
 
@@ -608,7 +587,7 @@ class ChessMIMOModelV3(nn.Module):
 class MIMOLoss(nn.Module):
     """Kendall multi-task loss with learnable log-variance weighting."""
 
-    HEADS = ['move_logits', 'mistake_prob', 'win_prob_before', 'win_prob_after', 'time_spent']
+    HEADS = ['move_logits', 'mistake_prob', 'win_prob_before', 'time_spent']
 
     def __init__(self):
         super().__init__()
@@ -636,10 +615,6 @@ class MIMOLoss(nn.Module):
         if 'win_prob_before' in predictions and 'win_prob_before' in targets:
             log_pred = torch.log(predictions['win_prob_before'].clamp(min=1e-8))
             losses['win_prob_before'] = -(targets['win_prob_before'] * log_pred).sum(-1).mean()
-
-        if 'win_prob_after' in predictions and 'win_prob_after' in targets:
-            log_pred = torch.log(predictions['win_prob_after'].clamp(min=1e-8))
-            losses['win_prob_after'] = -(targets['win_prob_after'] * log_pred).sum(-1).mean()
 
         if 'time_spent' in predictions and 'time_spent_log' in targets:
             losses['time_spent'] = F.huber_loss(
@@ -693,7 +668,6 @@ if __name__ == '__main__':
         'move_idx': torch.randint(0, 25, (B,)),
         'is_mistake': torch.randint(0, 2, (B,)).float(),
         'win_prob_before': F.softmax(torch.randn(B, 3), dim=-1),
-        'win_prob_after': F.softmax(torch.randn(B, 3), dim=-1),
         'time_spent_log': torch.rand(B) * 4,
     }
     criterion = MIMOLoss()

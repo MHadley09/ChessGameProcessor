@@ -70,67 +70,86 @@ def _piece_bitboards(board: chess.Board) -> List[int]:
     return bbs
 
 
-def board_to_planes(board: chess.Board, history: Optional[List[Tuple[int, int]]] = None) -> np.ndarray:
-    """Bitboard-accelerated FEN → (47, 8, 8) plane construction.
-    
-    Uses numpy batch ops on python-chess bitboards instead of per-square
-    Python iteration. Drop-in replacement for the original version.
-    """
-    planes = np.zeros((47, 8, 8), dtype=np.float32)
+NUM_PLANES = 23  # Reduced from 47 — history planes were always zeros (board from FEN has no move stack)
 
-    # --- Piece planes 0-11 (current position, batch all 12 at once) ---
+def board_to_planes(board: chess.Board, history: Optional[List[Tuple[int, int]]] = None) -> np.ndarray:
+    """Bitboard-accelerated FEN → (23, 8, 8) plane construction.
+
+    Plane layout (23 channels):
+        0-11:  piece planes (W-pawn..W-king, B-pawn..B-king)
+        12-13: last move from/to squares
+        14-15: second-to-last move from/to squares
+        16:    side to move (1.0 = White)
+        17:    White kingside castling
+        18:    White queenside castling
+        19:    Black kingside castling
+        20:    Black queenside castling
+        21:    en passant square
+        22:    halfmove clock / 100
+
+    History piece planes (old 12-35) removed — the board is constructed
+    from fen_before which has no move stack, so those channels were always
+    zeros.  Move history is still encoded via from/to square planes 12-15.
+    """
+    planes = np.zeros((NUM_PLANES, 8, 8), dtype=np.float32)
+
+    # --- Piece planes 0-11 ---
     bbs = _piece_bitboards(board)
     p12 = _bb_to_planes_batch(bbs)
     for i in range(12):
         if bbs[i]:
             planes[i] = p12[i]
 
-    # --- History planes 12-35 (up to 2 previous positions) ---
+    # --- Move history squares 12-15 ---
     if history:
-        try:
-            temp = board.copy()
-            if temp.move_stack and len(history) >= 1:
-                temp.pop()
-                h_bbs = _piece_bitboards(temp)
-                h_p = _bb_to_planes_batch(h_bbs)
-                for i in range(12):
-                    if h_bbs[i]:
-                        planes[12 + i] = h_p[i]
-        except Exception:
-            pass
-        try:
-            temp2 = board.copy()
-            if len(temp2.move_stack) >= 2 and len(history) >= 2:
-                temp2.pop()
-                temp2.pop()
-                h_bbs2 = _piece_bitboards(temp2)
-                h_p2 = _bb_to_planes_batch(h_bbs2)
-                for i in range(12):
-                    if h_bbs2[i]:
-                        planes[24 + i] = h_p2[i]
-        except Exception:
-            pass
-
         if len(history) >= 1:
             fr, to = history[0]
             if fr is not None:
-                planes[36, 7 - fr // 8, fr % 8] = 1.0
-                planes[37, 7 - to // 8, to % 8] = 1.0
+                planes[12, 7 - fr // 8, fr % 8] = 1.0
+                planes[13, 7 - to // 8, to % 8] = 1.0
         if len(history) >= 2:
             fr, to = history[1]
             if fr is not None:
-                planes[38, 7 - fr // 8, fr % 8] = 1.0
-                planes[39, 7 - to // 8, to % 8] = 1.0
+                planes[14, 7 - fr // 8, fr % 8] = 1.0
+                planes[15, 7 - to // 8, to % 8] = 1.0
 
-    planes[40, :, :] = 1.0 if board.turn == chess.WHITE else 0.0
-    planes[41, :, :] = 1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0
-    planes[42, :, :] = 1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0
-    planes[43, :, :] = 1.0 if board.has_kingside_castling_rights(chess.BLACK) else 0.0
-    planes[44, :, :] = 1.0 if board.has_queenside_castling_rights(chess.BLACK) else 0.0
+    # --- Metadata planes 16-22 ---
+    planes[16, :, :] = 1.0 if board.turn == chess.WHITE else 0.0
+    planes[17, :, :] = 1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0
+    planes[18, :, :] = 1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0
+    planes[19, :, :] = 1.0 if board.has_kingside_castling_rights(chess.BLACK) else 0.0
+    planes[20, :, :] = 1.0 if board.has_queenside_castling_rights(chess.BLACK) else 0.0
     if board.ep_square is not None:
-        planes[45, 7 - board.ep_square // 8, board.ep_square % 8] = 1.0
-    planes[46, :, :] = min(board.halfmove_clock, 100) / 100.0
+        planes[21, 7 - board.ep_square // 8, board.ep_square % 8] = 1.0
+    planes[22, :, :] = min(board.halfmove_clock, 100) / 100.0
     return planes
+
+
+# ---------------------------------------------------------------------------
+# UCI move → (from_sq, to_sq, promo) parser
+# ---------------------------------------------------------------------------
+
+def parse_uci_move(uci: str) -> tuple:
+    """
+    Parse a UCI move string into (from_sq, to_sq, promo) integers.
+
+    from_sq, to_sq: 0-63 chess square index (0=a1, 63=h8)
+    promo: 0=none, 1=knight, 2=bishop, 3=rook, 4=queen
+
+    Examples:
+        parse_uci_move("e2e4")  → (12, 28, 0)
+        parse_uci_move("e7e8q") → (52, 60, 4)
+    """
+    from_file = ord(uci[0]) - ord('a')
+    from_rank = int(uci[1]) - 1
+    to_file   = ord(uci[2]) - ord('a')
+    to_rank   = int(uci[3]) - 1
+    from_sq = from_rank * 8 + from_file
+    to_sq   = to_rank   * 8 + to_file
+    promo = 0
+    if len(uci) >= 5:
+        promo = {'n': 1, 'b': 2, 'r': 3, 'q': 4}.get(uci[4].lower(), 0)
+    return from_sq, to_sq, promo
 
 
 # ---------------------------------------------------------------------------
@@ -464,16 +483,27 @@ class MIMOCompactDataset(Dataset):
     # Keys that __getitem__ actually uses (possible_fen_after dropped — push/pop is faster)
     _SHARD_LOAD_KEYS = frozenset([
         'fen_before', 'game_to_position', 'possible_uci',
-        'possible_scalars', 'possible_mask', 'tabular',
+        'possible_mask',
+        'tabular',
         'actual_idx', 'is_mistake', 'win_prob_before',
         'time_spent_log',
     ])
     # Numeric arrays that can be memory-mapped (zero per-worker RAM)
+    # NOTE: possible_scalars is stored as sparse (scalars_data + scalars_offsets)
+    # NOTE: possible_from_sq/to_sq/promo are parsed at runtime from possible_uci
     _NUMERIC_KEYS = frozenset([
-        'possible_scalars', 'possible_mask', 'tabular',
+        'possible_mask',
+        'tabular',
         'actual_idx', 'is_mistake', 'win_prob_before',
         'time_spent_log',
     ])
+    # Dtype overrides for .npy cache compression (4.2x disk reduction).
+    # All arrays are cast back to original dtypes in __getitem__.
+    _DTYPE_OVERRIDES = {
+        'current_planes': np.float16,
+        'possible_mask': np.bool_,
+        'actual_idx': np.int16,
+    }
     # Object arrays that must be fully loaded (small, ~175 MB per shard)
     _OBJECT_KEYS = frozenset(['fen_before', 'game_to_position', 'possible_uci'])
 
@@ -515,8 +545,25 @@ class MIMOCompactDataset(Dataset):
                         # (fen_before, game_to_position, possible_uci) are loaded
                         # from the original .npz at shard-load time — saves ~30-40%
                         # cache disk space.
-                        if k in self._NUMERIC_KEYS or (k == 'game_phase' and self.with_phase):
-                            np.save(str(npy_dir / f'{k}.npy'), npz[k], allow_pickle=True)
+                        if k == 'possible_scalars':
+                            # Phase 2: sparse CSR-like storage for possible_scalars
+                            # Only store real (non-padded) moves — 86% less disk
+                            scalars = npz['possible_scalars']     # (shard_N, max_possible, 12)
+                            mask = npz['possible_mask']           # (shard_N, max_possible)
+                            n_legal = mask.sum(axis=1).astype(np.int32)
+                            offsets = np.zeros(len(n_legal) + 1, dtype=np.int32)
+                            np.cumsum(n_legal, out=offsets[1:])
+                            total_moves = int(offsets[-1])
+                            data = np.zeros((total_moves, 12), dtype=np.float32)
+                            for row_i in range(len(scalars)):
+                                data[offsets[row_i]:offsets[row_i + 1]] = scalars[row_i, :n_legal[row_i]]
+                            np.save(str(npy_dir / 'scalars_data.npy'), data)
+                            np.save(str(npy_dir / 'scalars_offsets.npy'), offsets)
+                        elif k in self._NUMERIC_KEYS or (k == 'game_phase' and self.with_phase):
+                            arr = npz[k]
+                            if k in self._DTYPE_OVERRIDES:
+                                arr = arr.astype(self._DTYPE_OVERRIDES[k])
+                            np.save(str(npy_dir / f'{k}.npy'), arr, allow_pickle=True)
                     npz.close()
                     del npz
                     gc.collect()
@@ -582,6 +629,13 @@ class MIMOCompactDataset(Dataset):
             if npy_path.exists():
                 shard_data[k] = np.load(str(npy_path), mmap_mode='r')
 
+        # Sparse possible_scalars: mmap data, fully load small offsets
+        sd_path = npy_dir / 'scalars_data.npy'
+        so_path = npy_dir / 'scalars_offsets.npy'
+        if sd_path.exists() and so_path.exists():
+            shard_data['scalars_data'] = np.load(str(sd_path), mmap_mode='r')
+            shard_data['scalars_offsets'] = np.load(str(so_path))  # small, load fully
+
         # Object arrays: load from original .npz (not extracted to save disk)
         npz = np.load(self.shard_files[shard_idx], allow_pickle=True)
         for k in self._OBJECT_KEYS:
@@ -605,7 +659,16 @@ class MIMOCompactDataset(Dataset):
             fen_before = str(data['fen_before'][local_idx])
             gtp = str(data['game_to_position'][local_idx])
             possible_uci = data['possible_uci'][local_idx]
-            possible_scalars = data['possible_scalars'][local_idx]
+            # Reconstruct possible_scalars from sparse CSR storage
+            if 'scalars_offsets' in data:
+                s_start = int(data['scalars_offsets'][local_idx])
+                s_end = int(data['scalars_offsets'][local_idx + 1])
+                n_moves = s_end - s_start
+                possible_scalars = np.zeros((self.max_possible, 12), dtype=np.float32)
+                if n_moves > 0:
+                    possible_scalars[:n_moves] = data['scalars_data'][s_start:s_end]
+            else:
+                possible_scalars = data['possible_scalars'][local_idx]
             possible_mask = data['possible_mask'][local_idx]
             tabular = data['tabular'][local_idx]
             actual_idx = int(data['actual_idx'][local_idx])
@@ -632,10 +695,13 @@ class MIMOCompactDataset(Dataset):
             recent = history[-2:] if history else []
             current_planes = board_to_planes(board, recent)
         except Exception:
-            current_planes = np.zeros((47, 8, 8), dtype=np.float32)
+            current_planes = np.zeros((NUM_PLANES, 8, 8), dtype=np.float32)
             recent = []
 
-        poss_planes = np.zeros((self.max_possible, 47, 8, 8), dtype=np.float32)
+        # Parse from_sq/to_sq/promo from UCI move strings at runtime
+        from_sqs = np.zeros(self.max_possible, dtype=np.int64)
+        to_sqs   = np.zeros(self.max_possible, dtype=np.int64)
+        promos   = np.zeros(self.max_possible, dtype=np.int64)
         for i in range(self.max_possible):
             if possible_mask[i] < 0.5:
                 break
@@ -643,26 +709,24 @@ class MIMOCompactDataset(Dataset):
             if not uci or len(uci) < 4:
                 continue
             try:
-                # Push/pop on the current board — avoids FEN string parsing
-                move = chess.Move.from_uci(uci)
-                from_sq = move.from_square
-                to_sq = move.to_square
-                poss_hist = [(from_sq, to_sq)] + (recent[:1] if recent else [])
-                board.push(move)
-                poss_planes[i] = board_to_planes(board, poss_hist)
-                board.pop()
+                f, t, p = parse_uci_move(uci)
+                from_sqs[i] = f
+                to_sqs[i]   = t
+                promos[i]   = p
             except Exception:
                 pass
 
         out = {
-            'current_planes': torch.from_numpy(current_planes).half(),
-            'possible_planes': torch.from_numpy(poss_planes).half(),
-            'possible_scalars': torch.from_numpy(possible_scalars.copy()).float(),
-            'possible_mask': torch.from_numpy(possible_mask.copy()).float(),
-            'tabular': torch.from_numpy(tabular.copy()).float(),
-            'actual_idx': torch.tensor(actual_idx, dtype=torch.long),
+            'current_planes': torch.from_numpy(np.array(current_planes, dtype=np.float16)),
+            'possible_scalars': torch.from_numpy(np.array(possible_scalars, dtype=np.float32)),
+            'possible_mask': torch.from_numpy(np.array(possible_mask, dtype=np.float32)),
+            'possible_from_sq': torch.from_numpy(from_sqs),
+            'possible_to_sq':   torch.from_numpy(to_sqs),
+            'possible_promo':   torch.from_numpy(promos),
+            'tabular': torch.from_numpy(np.array(tabular, dtype=np.float32)),
+            'actual_idx': torch.tensor(int(actual_idx), dtype=torch.long),
             'is_mistake': torch.tensor(is_mistake, dtype=torch.float32),
-            'win_prob_before': torch.from_numpy(win_prob_before.copy()).float(),
+            'win_prob_before': torch.from_numpy(np.array(win_prob_before, dtype=np.float32)),
             'time_spent_log': torch.tensor(time_spent_log, dtype=torch.float32),
         }
         if self.with_phase:

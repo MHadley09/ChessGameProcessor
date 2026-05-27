@@ -363,17 +363,12 @@ def build_features(board: chess.Board,
     move_ucis = []
     for i, (move, uci, ev, stm_eval) in enumerate(move_eval_list):
         move_ucis.append(uci)
-        # WDL from STM perspective
+        # WDL always from White's perspective — no STM flip
         # Scale LC0 WDL from 0-1 → 0-100 to match training data
         # (parallel_processor._wdl_percentages returns 0-100 scale)
-        if color == 'White':
-            wdl_w = ev.get('wdl_w', 0.0033) * 100.0
-            wdl_d = ev.get('wdl_d', 0.0034) * 100.0
-            wdl_l = ev.get('wdl_l', 0.0033) * 100.0
-        else:
-            wdl_w = ev.get('wdl_l', 0.0033) * 100.0   # STM win = opponent loss
-            wdl_d = ev.get('wdl_d', 0.0034) * 100.0
-            wdl_l = ev.get('wdl_w', 0.0033) * 100.0
+        wdl_w = ev.get('wdl_w', 0.0033) * 100.0
+        wdl_d = ev.get('wdl_d', 0.0034) * 100.0
+        wdl_l = ev.get('wdl_l', 0.0033) * 100.0
 
         nodes_raw = ev.get('nodes', 1)
         depth = ev.get('depth', 1)
@@ -421,14 +416,10 @@ def build_features(board: chess.Board,
     # WDL before move (from position eval — use best move's WDL)
     if move_eval_list:
         best_ev = move_eval_list[0][2]
-        if color == 'White':
-            stm_win_before = best_ev.get('wdl_w', 0.0033) * 100.0
-            stm_draw_before = best_ev.get('wdl_d', 0.0034) * 100.0
-            stm_loss_before = best_ev.get('wdl_l', 0.0033) * 100.0
-        else:
-            stm_win_before = best_ev.get('wdl_l', 0.0033) * 100.0
-            stm_draw_before = best_ev.get('wdl_d', 0.0034) * 100.0
-            stm_loss_before = best_ev.get('wdl_w', 0.0033) * 100.0
+        # Always White's perspective — no STM flip
+        stm_win_before = best_ev.get('wdl_w', 0.0033) * 100.0
+        stm_draw_before = best_ev.get('wdl_d', 0.0034) * 100.0
+        stm_loss_before = best_ev.get('wdl_l', 0.0033) * 100.0
     else:
         stm_win_before, stm_draw_before, stm_loss_before = 0.33, 0.34, 0.33
 
@@ -522,7 +513,6 @@ class MIMOPredictor:
         move_probs = torch.softmax(out['move_logits'], dim=-1).cpu().numpy()[0]
         mistake_prob = out['mistake_prob'].sigmoid().cpu().numpy()[0].item()
         wdl_before = out.get('win_prob_before')
-        wdl_after = out.get('win_prob_after')
         time_log = out['time_spent'].cpu().numpy()[0].item()
 
         preds = {
@@ -532,8 +522,6 @@ class MIMOPredictor:
         }
         if wdl_before is not None:
             preds['wdl_before'] = wdl_before.cpu().numpy()[0]  # already softmax from model
-        if wdl_after is not None:
-            preds['wdl_after'] = wdl_after.cpu().numpy()[0]  # already softmax from model
 
         return preds
 
@@ -558,7 +546,7 @@ def format_results(features: Dict, preds: Dict, board: chess.Board, top_k: int =
     # --- WDL Before ---
     if 'wdl_before' in preds:
         wdl = preds['wdl_before']
-        print(f"\n  Game outcome prediction (WDL from {color}'s view):")
+        print(f"\n  Game outcome prediction (WDL from White's view):")
         print(f"    Win {wdl[0]:.1%}  |  Draw {wdl[1]:.1%}  |  Loss {wdl[2]:.1%}")
 
     # --- Predicted time ---
@@ -582,13 +570,6 @@ def format_results(features: Dict, preds: Dict, board: chess.Board, top_k: int =
         except Exception:
             san = uci
         print(f"  {rank+1:>4}  {uci:>8}  {san:>8}  {prob:>6.1%}  {cumulative:>6.1%}")
-
-    # --- WDL After (for top move) ---
-    if 'wdl_after' in preds:
-        wdl_a = preds['wdl_after']
-        top_move = move_ucis[ranked[0]] if len(ranked) > 0 else '?'
-        print(f"\n  After predicted move ({top_move}), from opponent's view:")
-        print(f"    Win {wdl_a[0]:.1%}  |  Draw {wdl_a[1]:.1%}  |  Loss {wdl_a[2]:.1%}")
 
     # --- Mistake probability ---
     print(f"\n  Mistake probability: {preds['mistake_prob']:.1%}")

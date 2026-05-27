@@ -5,10 +5,8 @@ validate_mimo.py — Comprehensive validation for all 5 MIMO heads.
 Metrics computed:
     1. move_logits:       Top-1/3/5 accuracy, perplexity
     2. mistake_prob:      AUC-ROC, AUC-PR, calibration
-    3. win_prob_before:   Brier score, ECE, accuracy (with leakage check)
-    4. win_prob_after:    Brier score, ECE, accuracy
-    5. time_spent:        MAE, RMSE, Pearson r, Spearman ρ, bucket calibration
-    6. Leakage detector:  before should be LESS accurate than after
+    3. win_prob_before:   Brier score, ECE, accuracy (from White's perspective)
+    4. time_spent:        MAE, RMSE, Pearson r, Spearman ρ, bucket calibration
 
 Outputs:
     - metrics.json       — all numbers
@@ -40,7 +38,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from chess_mimo_model_v3 import ChessMIMOModelV3
-from mimo_dataset_polars import MIMOCompactDataset, dynamic_collate
+from mimo_dataset_polars import MIMOCompactDataset
 
 # Optional sklearn / matplotlib
 try:
@@ -112,14 +110,11 @@ def collect_predictions(model, loader, device):
         preds['mistake_prob'].append(outputs['mistake_prob'].sigmoid().cpu().numpy())
         if 'win_prob_before' in outputs:
             preds['win_prob_before'].append(outputs['win_prob_before'].cpu().numpy())
-        if 'win_prob_after' in outputs:
-            preds['win_prob_after'].append(outputs['win_prob_after'].cpu().numpy())
         preds['time_spent'].append(outputs['time_spent'].cpu().numpy())
 
         targs['move_idx'].append(batch['actual_idx'].numpy())
         targs['is_mistake'].append(batch['is_mistake'].numpy())
         targs['win_prob_before'].append(batch['win_prob_before'].numpy())
-        targs['win_prob_after'].append(batch['win_prob_after'].numpy())
         targs['time_spent_log'].append(batch['time_spent_log'].numpy())
 
         meta['move_no'].append(batch['tabular'][:, 4].numpy() * 200)  # un-normalise
@@ -210,12 +205,12 @@ def compute_all_metrics(preds, targs, meta):
             print(f"  mistake_auc_{elo_name:10s}  {auc:.4f}  (n={mask.sum()})")
 
     # ------------------------------------------------------------------
-    # 3 & 4. Win probability before / after
+    # 3. Win probability before (from White's perspective)
     # ------------------------------------------------------------------
-    for key in ['win_prob_before', 'win_prob_after']:
+    for key in ['win_prob_before']:
         if key not in preds:
             continue
-        print(f"\n3/4. {key.upper()}")
+        print(f"\n3. {key.upper()}")
         print('-' * 40)
         p = preds[key]
         t = targs[key]
@@ -273,22 +268,16 @@ def compute_all_metrics(preds, targs, meta):
     # ------------------------------------------------------------------
     # 6. Leakage check
     # ------------------------------------------------------------------
-    print(f"\n6. LEAKAGE CHECK")
+    print(f"\n5. SANITY CHECK")
     print('-' * 40)
     before_acc = metrics.get('win_prob_before_accuracy', 0)
-    after_acc  = metrics.get('win_prob_after_accuracy', 0)
     print(f"  win_prob_before accuracy: {before_acc:.4f}")
-    print(f"  win_prob_after  accuracy: {after_acc:.4f}")
 
     if before_acc > 0.85:
-        print("  ⚠  WARNING: win_prob_before suspiciously high — possible masking failure!")
-        metrics['leakage_warning'] = True
-    elif before_acc > after_acc + 0.05:
-        print("  ⚠  WARNING: before MORE accurate than after — masking is likely broken!")
+        print("  ⚠  WARNING: win_prob_before suspiciously high — check data!")
         metrics['leakage_warning'] = True
     else:
-        gap = after_acc - before_acc
-        print(f"  ✓  Masking looks correct (after is {gap:.3f} more accurate)")
+        print(f"  ✓  WDL accuracy looks reasonable")
         metrics['leakage_warning'] = False
 
     print('=' * 60)
@@ -329,9 +318,7 @@ def plot_calibration(preds, targs, output_dir):
                              targs['win_prob_before'], 'WDL Before')
 
     # WDL after
-    if 'win_prob_after' in preds:
-        _plot_multiclass_cal(axes[1, 0], preds['win_prob_after'],
-                             targs['win_prob_after'], 'WDL After')
+    axes[1, 0].set_visible(False)  # Placeholder (wdl_after removed)
 
     # Time
     ax = axes[1, 1]
@@ -439,7 +426,6 @@ def main():
                         num_workers=args.num_workers, pin_memory=False,
                         prefetch_factor=2 if args.num_workers > 0 else None,
                         persistent_workers=args.num_workers > 0,
-                        collate_fn=dynamic_collate)
     print(f"[DATA] {len(ds):,} examples → {len(loader):,} batches")
 
     # Run

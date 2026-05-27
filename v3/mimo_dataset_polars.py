@@ -174,13 +174,14 @@ def parse_game_to_position(gtp_str: str) -> List[Tuple[int, int]]:
     return moves
 
 
-def result_to_wdl(result: str, color: str) -> np.ndarray:
+def result_to_wdl(result: str) -> np.ndarray:
+    """Game outcome from White's perspective. No color parameter needed."""
     if result == '1-0':
-        return np.array([1., 0., 0.], dtype=np.float32) if color == 'White' else np.array([0., 0., 1.], dtype=np.float32)
+        return np.array([1., 0., 0.], dtype=np.float32)  # White won
     elif result == '0-1':
-        return np.array([1., 0., 0.], dtype=np.float32) if color == 'Black' else np.array([0., 0., 1.], dtype=np.float32)
+        return np.array([0., 0., 1.], dtype=np.float32)  # White lost
     else:
-        return np.array([0., 1., 0.], dtype=np.float32)
+        return np.array([0., 1., 0.], dtype=np.float32)  # Draw
 
 
 def _safe_float(val, default: float = 0.0) -> float:
@@ -272,14 +273,10 @@ def build_one_compact(move_dict: Dict, game_dict: Dict, possibles: List[Dict], m
         poss_fen_after_list.append(pm.get('fen_after', ''))
         pm_eval_stm = evals_stm[i]
 
-        if color == 'White':
-            pm_stm_win  = _safe_float(pm.get('white_win_perc'), 0.33)
-            pm_stm_draw = _safe_float(pm.get('draw_perc'), 0.34)
-            pm_stm_loss = _safe_float(pm.get('black_win_perc'), 0.33)
-        else:
-            pm_stm_win  = _safe_float(pm.get('black_win_perc'), 0.33)
-            pm_stm_draw = _safe_float(pm.get('draw_perc'), 0.34)
-            pm_stm_loss = _safe_float(pm.get('white_win_perc'), 0.33)
+        # Always read White's perspective — no STM flip
+        pm_stm_win  = _safe_float(pm.get('white_win_perc'), 0.33)
+        pm_stm_draw = _safe_float(pm.get('draw_perc'), 0.34)
+        pm_stm_loss = _safe_float(pm.get('black_win_perc'), 0.33)
 
         nodes_raw = _safe_float(pm.get('nodes'), 1)
         move_quality = ((pm_eval_stm - worst_eval_stm) / eval_range) if eval_range > 0 else 1.0
@@ -328,14 +325,10 @@ def build_one_compact(move_dict: Dict, game_dict: Dict, possibles: List[Dict], m
     eval_raw = _safe_float(move_dict.get('eval_before'), 0)
     eval_stm = eval_raw if color == 'White' else -eval_raw
 
-    if color == 'White':
-        stm_win_before  = _safe_float(move_dict.get('white_win_perc_before'), 0.33)
-        stm_draw_before = _safe_float(move_dict.get('draw_perc_before'), 0.34)
-        stm_loss_before = _safe_float(move_dict.get('black_win_perc_before'), 0.33)
-    else:
-        stm_win_before  = _safe_float(move_dict.get('black_win_perc_before'), 0.33)
-        stm_draw_before = _safe_float(move_dict.get('draw_perc_before'), 0.34)
-        stm_loss_before = _safe_float(move_dict.get('white_win_perc_before'), 0.33)
+    # Always White's perspective — no STM flip
+    stm_win_before  = _safe_float(move_dict.get('white_win_perc_before'), 0.33)
+    stm_draw_before = _safe_float(move_dict.get('draw_perc_before'), 0.34)
+    stm_loss_before = _safe_float(move_dict.get('black_win_perc_before'), 0.33)
 
     initial_time, increment = parse_time_control(game_dict.get('time_control', ''))
     prev_capture = detect_prev_capture(move_dict.get('game_to_position', ''))
@@ -377,47 +370,36 @@ def build_one_compact(move_dict: Dict, game_dict: Dict, possibles: List[Dict], m
 
     is_mistake = 0.0
     if actual_idx >= 0 and len(possibles) > 0:
-        def _expected_score(pm_dict, clr):
-            if clr == 'White':
-                w = _safe_float(pm_dict.get('white_win_perc'), 0.33)
-                d = _safe_float(pm_dict.get('draw_perc'), 0.34)
-            else:
-                w = _safe_float(pm_dict.get('black_win_perc'), 0.33)
-                d = _safe_float(pm_dict.get('draw_perc'), 0.34)
+        def _expected_score(pm_dict):
+            w = _safe_float(pm_dict.get('white_win_perc'), 0.33)
+            d = _safe_float(pm_dict.get('draw_perc'), 0.34)
             return w + 0.5 * d
 
-        def _outcome_class(pm_dict, clr):
-            if clr == 'White':
-                w = _safe_float(pm_dict.get('white_win_perc'), 0.33)
-                d = _safe_float(pm_dict.get('draw_perc'), 0.34)
-                l = _safe_float(pm_dict.get('black_win_perc'), 0.33)
-            else:
-                w = _safe_float(pm_dict.get('black_win_perc'), 0.33)
-                d = _safe_float(pm_dict.get('draw_perc'), 0.34)
-                l = _safe_float(pm_dict.get('white_win_perc'), 0.33)
+        def _outcome_class(pm_dict):
+            w = _safe_float(pm_dict.get('white_win_perc'), 0.33)
+            d = _safe_float(pm_dict.get('draw_perc'), 0.34)
+            l = _safe_float(pm_dict.get('black_win_perc'), 0.33)
             mx = max(w, d, l)
             if mx == w: return 'W'
             elif mx == d: return 'D'
             return 'L'
 
-        best_idx = max(range(len(possibles)), key=lambda i: _expected_score(possibles[i], color))
-        best_es = _expected_score(possibles[best_idx], color)
-        played_es = _expected_score(possibles[actual_idx], color)
+        best_idx = max(range(len(possibles)), key=lambda i: _expected_score(possibles[i]))
+        best_es = _expected_score(possibles[best_idx])
+        played_es = _expected_score(possibles[actual_idx])
         drop = best_es - played_es
         avg_elo = (w_elo + b_elo) / 2
         threshold = 0.20 if avg_elo < 1500 else (0.15 if avg_elo < 2500 else 0.10)
         if drop > threshold:
             is_mistake = 1.0
         if drop > 0.05 and is_mistake == 0.0:
-            best_outcome = _outcome_class(possibles[best_idx], color)
-            played_outcome = _outcome_class(possibles[actual_idx], color)
+            best_outcome = _outcome_class(possibles[best_idx])
+            played_outcome = _outcome_class(possibles[actual_idx])
             outcome_rank = {'W': 2, 'D': 1, 'L': 0}
             if outcome_rank[played_outcome] < outcome_rank[best_outcome]:
                 is_mistake = 1.0
 
-    wdl_before = result_to_wdl(game_result, color)
-    color_after = 'Black' if color == 'White' else 'White'
-    wdl_after = result_to_wdl(game_result, color_after)
+    wdl_before = result_to_wdl(game_result)
     raw_ts = max(0.0, _safe_float(move_dict.get('time_spent')))
     time_spent_log = np.float32(math.log1p(raw_ts))
     gtp = str(move_dict.get('game_to_position', '')) if move_dict.get('game_to_position') else ''
@@ -433,7 +415,6 @@ def build_one_compact(move_dict: Dict, game_dict: Dict, possibles: List[Dict], m
         'actual_idx': np.int64(actual_idx),
         'is_mistake': np.float32(is_mistake),
         'win_prob_before': wdl_before,
-        'win_prob_after': wdl_after,
         'time_spent_log': time_spent_log,
     }
     
@@ -533,16 +514,27 @@ class MIMOCompactDataset(Dataset):
     # Keys that __getitem__ actually uses (possible_fen_after dropped — push/pop is faster)
     _SHARD_LOAD_KEYS = frozenset([
         'fen_before', 'game_to_position', 'possible_uci',
-        'possible_scalars', 'possible_mask', 'tabular',
-        'actual_idx', 'is_mistake', 'win_prob_before', 'win_prob_after',
+        'possible_mask', 'tabular',
+        'actual_idx', 'is_mistake', 'win_prob_before',
         'time_spent_log',
     ])
     # Numeric arrays that can be memory-mapped (zero per-worker RAM)
+    # NOTE: possible_scalars is stored as sparse (scalars_data + scalars_offsets)
     _NUMERIC_KEYS = frozenset([
-        'possible_scalars', 'possible_mask', 'tabular',
-        'actual_idx', 'is_mistake', 'win_prob_before', 'win_prob_after',
+        'possible_mask', 'tabular',
+        'actual_idx', 'is_mistake', 'win_prob_before',
         'time_spent_log',
     ])
+    # Dtype overrides for .npy cache compression (4.2x disk reduction).
+    # All arrays are cast back to original dtypes in __getitem__.
+    _DTYPE_OVERRIDES = {
+        'current_planes': np.float16,
+        'possible_mask': np.bool_,
+        'possible_from_sq': np.int8,
+        'possible_to_sq': np.int8,
+        'possible_promo': np.int8,
+        'actual_idx': np.int16,
+    }
     # Object arrays that must be fully loaded (small, ~175 MB per shard)
     _OBJECT_KEYS = frozenset(['fen_before', 'game_to_position', 'possible_uci'])
 
@@ -584,8 +576,25 @@ class MIMOCompactDataset(Dataset):
                         # (fen_before, game_to_position, possible_uci) are loaded
                         # from the original .npz at shard-load time — saves ~30-40%
                         # cache disk space.
-                        if k in self._NUMERIC_KEYS or (k == 'game_phase' and self.with_phase):
-                            np.save(str(npy_dir / f'{k}.npy'), npz[k], allow_pickle=True)
+                        if k == 'possible_scalars':
+                            # Phase 2: sparse CSR-like storage for possible_scalars
+                            # Only store real (non-padded) moves — 86% less disk
+                            scalars = npz['possible_scalars']     # (shard_N, max_possible, 12)
+                            mask = npz['possible_mask']           # (shard_N, max_possible)
+                            n_legal = mask.sum(axis=1).astype(np.int32)
+                            offsets = np.zeros(len(n_legal) + 1, dtype=np.int32)
+                            np.cumsum(n_legal, out=offsets[1:])
+                            total_moves = int(offsets[-1])
+                            data = np.zeros((total_moves, 12), dtype=np.float32)
+                            for row_i in range(len(scalars)):
+                                data[offsets[row_i]:offsets[row_i + 1]] = scalars[row_i, :n_legal[row_i]]
+                            np.save(str(npy_dir / 'scalars_data.npy'), data)
+                            np.save(str(npy_dir / 'scalars_offsets.npy'), offsets)
+                        elif k in self._NUMERIC_KEYS or (k == 'game_phase' and self.with_phase):
+                            arr = npz[k]
+                            if k in self._DTYPE_OVERRIDES:
+                                arr = arr.astype(self._DTYPE_OVERRIDES[k])
+                            np.save(str(npy_dir / f'{k}.npy'), arr, allow_pickle=True)
                     npz.close()
                     del npz
                     gc.collect()
@@ -617,7 +626,6 @@ class MIMOCompactDataset(Dataset):
             self.actual_idx = data['actual_idx']
             self.is_mistake = data['is_mistake']
             self.win_prob_before = data['win_prob_before']
-            self.win_prob_after = data['win_prob_after']
             self.time_spent_log = data['time_spent_log']
             if with_phase and 'game_phase' in data:
                 self.game_phase = data['game_phase']
@@ -652,6 +660,13 @@ class MIMOCompactDataset(Dataset):
             if npy_path.exists():
                 shard_data[k] = np.load(str(npy_path), mmap_mode='r')
 
+        # Sparse possible_scalars: mmap data, fully load small offsets
+        sd_path = npy_dir / 'scalars_data.npy'
+        so_path = npy_dir / 'scalars_offsets.npy'
+        if sd_path.exists() and so_path.exists():
+            shard_data['scalars_data'] = np.load(str(sd_path), mmap_mode='r')
+            shard_data['scalars_offsets'] = np.load(str(so_path))  # small, load fully
+
         # Object arrays: load from original .npz (not extracted to save disk)
         npz = np.load(self.shard_files[shard_idx], allow_pickle=True)
         for k in self._OBJECT_KEYS:
@@ -675,13 +690,21 @@ class MIMOCompactDataset(Dataset):
             fen_before = str(data['fen_before'][local_idx])
             gtp = str(data['game_to_position'][local_idx])
             possible_uci = data['possible_uci'][local_idx]
-            possible_scalars = data['possible_scalars'][local_idx]
+            # Reconstruct possible_scalars from sparse CSR storage
+            if 'scalars_offsets' in data:
+                s_start = int(data['scalars_offsets'][local_idx])
+                s_end = int(data['scalars_offsets'][local_idx + 1])
+                n_moves = s_end - s_start
+                possible_scalars = np.zeros((self.max_possible, 12), dtype=np.float32)
+                if n_moves > 0:
+                    possible_scalars[:n_moves] = data['scalars_data'][s_start:s_end]
+            else:
+                possible_scalars = data['possible_scalars'][local_idx]
             possible_mask = data['possible_mask'][local_idx]
             tabular = data['tabular'][local_idx]
             actual_idx = int(data['actual_idx'][local_idx])
             is_mistake = float(data['is_mistake'][local_idx])
             win_prob_before = data['win_prob_before'][local_idx]
-            win_prob_after = data['win_prob_after'][local_idx]
             time_spent_log = float(data['time_spent_log'][local_idx])
             game_phase = int(data.get('game_phase', [0]*len(data['fen_before']))[local_idx]) if self.with_phase else 0
         else:
@@ -694,7 +717,6 @@ class MIMOCompactDataset(Dataset):
             actual_idx = int(self.actual_idx[idx])
             is_mistake = float(self.is_mistake[idx])
             win_prob_before = self.win_prob_before[idx]
-            win_prob_after = self.win_prob_after[idx]
             time_spent_log = float(self.time_spent_log[idx])
             game_phase = int(self.game_phase[idx]) if self.with_phase and hasattr(self, 'game_phase') else 0
 
@@ -728,17 +750,16 @@ class MIMOCompactDataset(Dataset):
                 pass
 
         out = {
-            'current_planes': torch.from_numpy(current_planes).half(),
-            'possible_from_sq': torch.from_numpy(from_sqs),
-            'possible_to_sq':   torch.from_numpy(to_sqs),
-            'possible_promo':   torch.from_numpy(promos),
-            'possible_scalars': torch.from_numpy(possible_scalars.copy()).float(),
-            'possible_mask': torch.from_numpy(possible_mask.copy()).float(),
-            'tabular': torch.from_numpy(tabular.copy()).float(),
-            'actual_idx': torch.tensor(actual_idx, dtype=torch.long),
+            'current_planes': torch.from_numpy(np.asarray(current_planes, dtype=np.float32)).half(),
+            'possible_from_sq': torch.from_numpy(np.asarray(from_sqs, dtype=np.int64)),
+            'possible_to_sq':   torch.from_numpy(np.asarray(to_sqs, dtype=np.int64)),
+            'possible_promo':   torch.from_numpy(np.asarray(promos, dtype=np.int64)),
+            'possible_scalars': torch.from_numpy(np.asarray(possible_scalars, dtype=np.float32)).float(),
+            'possible_mask': torch.from_numpy(np.asarray(possible_mask, dtype=np.float32)).float(),
+            'tabular': torch.from_numpy(np.asarray(tabular, dtype=np.float32)).float(),
+            'actual_idx': torch.tensor(int(actual_idx), dtype=torch.long),
             'is_mistake': torch.tensor(is_mistake, dtype=torch.float32),
-            'win_prob_before': torch.from_numpy(win_prob_before.copy()).float(),
-            'win_prob_after': torch.from_numpy(win_prob_after.copy()).float(),
+            'win_prob_before': torch.from_numpy(np.asarray(win_prob_before, dtype=np.float32)).float(),
             'time_spent_log': torch.tensor(time_spent_log, dtype=torch.float32),
         }
         if self.with_phase:
@@ -966,7 +987,6 @@ def build_dataset(data_dir: str, output_dir: str, max_possible: int = 220,
                     'actual_idx': np.array([e['actual_idx'] for e in examples]),
                     'is_mistake': np.array([e['is_mistake'] for e in examples]),
                     'win_prob_before': np.stack([e['win_prob_before'] for e in examples]),
-                    'win_prob_after': np.stack([e['win_prob_after'] for e in examples]),
                     'time_spent_log': np.array([e['time_spent_log'] for e in examples]),
                 }
                 if with_phase:

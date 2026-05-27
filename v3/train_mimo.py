@@ -40,7 +40,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.amp import GradScaler, autocast
-from mimo_dataset_polars import MIMOCompactDataset, ShardGroupSampler, dynamic_collate
+from mimo_dataset_polars import MIMOCompactDataset, ShardGroupSampler
 
 from chess_mimo_model_v3 import ChessMIMOModelV3, MIMOLoss
 
@@ -141,7 +141,6 @@ def train_epoch(model, loader, criterion, optimizer, scheduler, scaler,
             'move_idx':        aidx,
             'is_mistake':      batch['is_mistake'].to(device, non_blocking=True),
             'win_prob_before': batch['win_prob_before'].to(device, non_blocking=True),
-            'win_prob_after':  batch['win_prob_after'].to(device, non_blocking=True),
             'time_spent_log':  batch['time_spent_log'].to(device, non_blocking=True),
         }
 
@@ -274,7 +273,6 @@ def validate(model, loader, criterion, device, use_amp):
             'move_idx':        aidx,
             'is_mistake':      batch['is_mistake'].to(device, non_blocking=True),
             'win_prob_before': batch['win_prob_before'].to(device, non_blocking=True),
-            'win_prob_after':  batch['win_prob_after'].to(device, non_blocking=True),
             'time_spent_log':  batch['time_spent_log'].to(device, non_blocking=True),
         }
 
@@ -366,7 +364,6 @@ def main():
 
     # Reproducibility
     torch.manual_seed(args.seed)
-    # Skip CUDA graph capture for dynamic shapes (dynamic_collate varies M per batch)
     torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
     np.random.seed(args.seed)
     if 'cuda' in args.device:
@@ -402,14 +399,12 @@ def main():
         num_workers=args.num_workers, pin_memory=args.pin_memory, drop_last=True,
         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
         persistent_workers=args.num_workers > 0,
-        collate_fn=dynamic_collate,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=args.pin_memory,
         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
         persistent_workers=args.num_workers > 0,
-        collate_fn=dynamic_collate,
     )
 
     print(f"[DATA] train: {len(train_ds):,} examples → {len(train_loader):,} batches")

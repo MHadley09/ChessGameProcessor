@@ -133,15 +133,21 @@ class MIMOUCIEngine:
             opt['value'] = value
         self._log(f"Set {name} = {opt['value']}")
 
-    def cmd_isready(self):
-        """Lazy-init model + LC0 engine on first isready."""
+    def _ensure_init(self):
+        """Init model + LC0 engine if paths are configured and not yet loaded."""
         if self.predictor is None and self._opt('Checkpoint'):
             self.predictor = MIMOPredictor(self._opt('Checkpoint'), self._device)
             self._log(f"Model loaded on {self._device}")
+            print(f"info string Model loaded ({self._device})", flush=True)
         if self.lc0_engine is None and self._opt('LC0Path'):
             weights = self._opt('LC0Weights') or None
             self.lc0_engine = LC0Engine(self._opt('LC0Path'), weights)
             self._log("LC0 engine started")
+            print("info string LC0 engine started", flush=True)
+
+    def cmd_isready(self):
+        """Init model + LC0 engine on first isready (or after setoption)."""
+        self._ensure_init()
         print("readyok", flush=True)
 
     def cmd_ucinewgame(self):
@@ -376,6 +382,15 @@ def main():
     args = parser.parse_args()
 
     engine = MIMOUCIEngine(args)
+
+    # Eager init if CLI args provided — don't wait for isready
+    if args.checkpoint and args.lc0:
+        engine._ensure_init()
+        if engine.predictor is None:
+            print("info string ERROR: Failed to load model checkpoint", flush=True)
+        if engine.lc0_engine is None:
+            print("info string ERROR: Failed to start LC0 engine", flush=True)
+
     engine.run()
 
 
