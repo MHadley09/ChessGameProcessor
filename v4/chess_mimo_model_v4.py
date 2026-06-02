@@ -232,6 +232,86 @@ class ExpertModule(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Expert & Move Head Registries
+# ---------------------------------------------------------------------------
+
+_EXPERT_REGISTRY: Dict[str, dict] = {}
+_MOVE_HEAD_REGISTRY: Dict[str, dict] = {}
+
+
+def register_expert(name: str, factory, hidden_dim: int):
+    """Register an expert architecture.
+
+    factory(input_dim, output_dim, dropout) -> nn.Module
+    forward() must return (hidden, output) where hidden.shape[-1] == hidden_dim.
+    """
+    _EXPERT_REGISTRY[name] = {'factory': factory, 'hidden_dim': hidden_dim}
+
+
+def register_move_head(name: str, factory):
+    """Register a move-head architecture.
+
+    factory(input_dim, hidden_dim, dropout) -> nn.Module
+    forward(B*M, input_dim) -> (B*M, 1)
+    """
+    _MOVE_HEAD_REGISTRY[name] = {'factory': factory}
+
+
+def list_experts() -> Dict[str, int]:
+    """Return {name: hidden_dim} for all registered experts."""
+    return {k: v['hidden_dim'] for k, v in _EXPERT_REGISTRY.items()}
+
+
+def list_move_heads() -> list:
+    """Return names of all registered move heads."""
+    return list(_MOVE_HEAD_REGISTRY.keys())
+
+
+# ---- Built-in experts ----
+
+register_expert('default',
+    lambda in_d, out_d, dropout: ExpertModule(in_d, 128, out_d, n_layers=2, dropout=dropout),
+    hidden_dim=128)
+
+register_expert('deep_4L',
+    lambda in_d, out_d, dropout: ExpertModule(in_d, 128, out_d, n_layers=4, dropout=dropout),
+    hidden_dim=128)
+
+register_expert('wide_256',
+    lambda in_d, out_d, dropout: ExpertModule(in_d, 256, out_d, n_layers=2, dropout=dropout),
+    hidden_dim=256)
+
+register_expert('deep_wide',
+    lambda in_d, out_d, dropout: ExpertModule(in_d, 256, out_d, n_layers=4, dropout=dropout),
+    hidden_dim=256)
+
+
+# ---- Built-in move heads ----
+
+register_move_head('default',
+    lambda in_d, hid_d, dropout: nn.Sequential(
+        nn.Linear(in_d, hid_d), nn.LayerNorm(hid_d), nn.GELU(), nn.Dropout(dropout),
+        nn.Linear(hid_d, hid_d // 2), nn.GELU(),
+        nn.Linear(hid_d // 2, 1),
+    ))
+
+register_move_head('deep_4L',
+    lambda in_d, hid_d, dropout: nn.Sequential(
+        nn.Linear(in_d, hid_d), nn.LayerNorm(hid_d), nn.GELU(), nn.Dropout(dropout),
+        nn.Linear(hid_d, hid_d), nn.LayerNorm(hid_d), nn.GELU(), nn.Dropout(dropout),
+        nn.Linear(hid_d, hid_d // 2), nn.GELU(),
+        nn.Linear(hid_d // 2, 1),
+    ))
+
+register_move_head('wide_512',
+    lambda in_d, hid_d, dropout: nn.Sequential(
+        nn.Linear(in_d, 512), nn.LayerNorm(512), nn.GELU(), nn.Dropout(dropout),
+        nn.Linear(512, hid_d), nn.GELU(),
+        nn.Linear(hid_d, 1),
+    ))
+
+
+# ---------------------------------------------------------------------------
 # Main Model V4
 # ---------------------------------------------------------------------------
 
@@ -278,11 +358,16 @@ class ChessMIMOModelV4(nn.Module):
         move_scalar_dim: int = 12,
         expert_hidden: int = 128,
         expert_layers: int = 2,
+        mistake_expert_ver: str = 'default',
+        time_expert_ver: str = 'default',
+        wdl_expert_ver: str = 'default',
+        move_head_ver: str = 'default',
     ):
         super().__init__()
         self.max_possible = max_possible
         self.hidden_dim = hidden_dim
         self.expert_hidden = expert_hidden
+        self.dropout = dropout
 
         # ---- Encoders ----
         self.board_encoder = BoardEncoder(
@@ -318,29 +403,26 @@ class ChessMIMOModelV4(nn.Module):
             nn.GELU(), nn.Dropout(dropout),
         )
 
-        # ---- Expert Modules (from V2) ----
-        self.wdl_before_expert = ExpertModule(
-            input_dim=hidden_dim, hidden_dim=expert_hidden,
-            output_dim=3, n_layers=expert_layers, dropout=dropout,
-        )
-        self.mistake_expert = ExpertModule(
-            input_dim=hidden_dim, hidden_dim=expert_hidden,
-            output_dim=1, n_layers=expert_layers, dropout=dropout,
-        )
-        self.time_expert = ExpertModule(
-            input_dim=hidden_dim, hidden_dim=expert_hidden,
-            output_dim=1, n_layers=expert_layers, dropout=dropout,
-        )
+        # ---- Expert Modules (registry-backed, from V2) ----
+        self._expert_versions = {
+            'mistake': mistake_expert_ver,
+            'time': time_expert_ver,
+            'wdl': wdl_expert_ver,
+        }
+        self._move_head_version = move_head_ver
 
-        # ---- Move Head (deeper 3-layer with cross-feed — from V2) ----
-        cross_feed_dim = hidden_dim + 3 * expert_hidden  # 640
-        move_head_in = cross_feed_dim + hidden_dim        # 896
-        self.move_head = nn.Sequential(
-            nn.Linear(move_head_in, hidden_dim), nn.LayerNorm(hidden_dim),
-            nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim // 2), nn.GELU(),
-            nn.Linear(hidden_dim // 2, 1),
+        self.mistake_expert = self._build_expert(mistake_expert_ver, 1)
+        self.time_expert = self._build_expert(time_expert_ver, 1)
+        self.wdl_before_expert = self._build_expert(wdl_expert_ver, 3)
+
+        # ---- Move Head (registry-backed, cross-feed from experts) ----
+        self._cross_feed_dim = hidden_dim + sum(
+            _EXPERT_REGISTRY[v]['hidden_dim']
+            for v in [mistake_expert_ver, time_expert_ver, wdl_expert_ver]
         )
+        move_head_in = self._cross_feed_dim + hidden_dim
+        self.move_head = _MOVE_HEAD_REGISTRY[move_head_ver]['factory'](
+            move_head_in, hidden_dim, dropout)
 
         self._init_weights()
 
@@ -357,6 +439,90 @@ class ChessMIMOModelV4(nn.Module):
             elif isinstance(m, (nn.BatchNorm2d, nn.LayerNorm)):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
+
+    # ------------------------------------------------------------------
+    # Registry builders & hot-swap
+    # ------------------------------------------------------------------
+
+    def _build_expert(self, version: str, output_dim: int,
+                      dropout: Optional[float] = None) -> nn.Module:
+        """Instantiate an expert from the registry."""
+        if version not in _EXPERT_REGISTRY:
+            raise ValueError(f"Unknown expert version '{version}'. "
+                             f"Available: {list(_EXPERT_REGISTRY.keys())}")
+        d = dropout if dropout is not None else self.dropout
+        return _EXPERT_REGISTRY[version]['factory'](self.hidden_dim, output_dim, d)
+
+    def _build_move_head(self, version: str,
+                         dropout: Optional[float] = None) -> nn.Module:
+        """Instantiate a move head from the registry."""
+        if version not in _MOVE_HEAD_REGISTRY:
+            raise ValueError(f"Unknown move head version '{version}'. "
+                             f"Available: {list(_MOVE_HEAD_REGISTRY.keys())}")
+        d = dropout if dropout is not None else self.dropout
+        move_head_in = self._cross_feed_dim + self.hidden_dim
+        return _MOVE_HEAD_REGISTRY[version]['factory'](move_head_in, self.hidden_dim, d)
+
+    def _recompute_cross_feed_dim(self):
+        """Update cross_feed_dim from current expert versions."""
+        self._cross_feed_dim = self.hidden_dim + sum(
+            _EXPERT_REGISTRY[self._expert_versions[h]]['hidden_dim']
+            for h in ['mistake', 'time', 'wdl']
+        )
+
+    def swap_expert(self, head_name: str, version: str,
+                    dropout: Optional[float] = None,
+                    rebuild_move_head: bool = True) -> None:
+        """Hot-swap an expert module.  Rebuilds move head if hidden_dim changes.
+
+        Args:
+            head_name: 'mistake', 'time', or 'wdl'
+            version: registered expert name
+            dropout: dropout for new module (None = use model default)
+            rebuild_move_head: auto-rebuild move head if cross_feed_dim changes
+        """
+        output_dims = {'mistake': 1, 'time': 1, 'wdl': 3}
+        attr_names = {
+            'mistake': 'mistake_expert',
+            'time': 'time_expert',
+            'wdl': 'wdl_before_expert',
+        }
+        if head_name not in output_dims:
+            raise ValueError(f"head_name must be one of {list(output_dims.keys())}")
+
+        old_ver = self._expert_versions[head_name]
+        old_hidden = _EXPERT_REGISTRY[old_ver]['hidden_dim']
+        new_hidden = _EXPERT_REGISTRY[version]['hidden_dim']
+
+        new_expert = self._build_expert(version, output_dims[head_name], dropout)
+        setattr(self, attr_names[head_name], new_expert)
+        self._expert_versions[head_name] = version
+        self._recompute_cross_feed_dim()
+
+        if old_hidden != new_hidden and rebuild_move_head:
+            self.move_head = self._build_move_head(self._move_head_version, dropout)
+            print(f"  [SWAP] Expert '{head_name}' hidden changed "
+                  f"{old_hidden}→{new_hidden}, move head rebuilt (fresh weights)")
+
+        n = sum(p.numel() for p in new_expert.parameters())
+        print(f"  [SWAP] {head_name}_expert → '{version}' "
+              f"(hidden={new_hidden}, params={n:,})")
+
+    def swap_move_head(self, version: str,
+                       dropout: Optional[float] = None) -> None:
+        """Hot-swap the move head."""
+        self.move_head = self._build_move_head(version, dropout)
+        self._move_head_version = version
+        n = sum(p.numel() for p in self.move_head.parameters())
+        print(f"  [SWAP] move_head → '{version}' (params={n:,})")
+
+    @property
+    def component_versions(self) -> Dict[str, str]:
+        """Return version strings for all swappable components."""
+        return {
+            **{f'{k}_expert': v for k, v in self._expert_versions.items()},
+            'move_head': self._move_head_version,
+        }
 
     def _cross_attend(self, context, move_emb, key_padding_mask):
         query = self.query_proj(context).unsqueeze(1)
@@ -524,6 +690,7 @@ if __name__ == '__main__':
     model = ChessMIMOModelV4(max_possible=M)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"V4 Model parameters: {n_params:,}")
+    print(f"Component versions: {model.component_versions}")
 
     current = torch.randn(B, 23, 8, 8)
     from_sq = torch.randint(0, 64, (B, M))

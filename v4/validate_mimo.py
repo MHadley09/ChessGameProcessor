@@ -401,6 +401,7 @@ def main():
     print(f"Loading {args.checkpoint} …")
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     cfg = ckpt.get('config', {})
+    comp_ver = cfg.get('component_versions', {})
 
     model = ChessMIMOModelV4(
         cnn_channels=cfg.get('cnn_channels', 128),
@@ -408,6 +409,10 @@ def main():
         tabular_dim=18,
         max_possible=cfg.get('max_possible', 220),
         hidden_dim=cfg.get('hidden_dim', 256),
+        mistake_expert_ver=comp_ver.get('mistake_expert', 'default'),
+        time_expert_ver=comp_ver.get('time_expert', 'default'),
+        wdl_expert_ver=comp_ver.get('wdl_expert', 'default'),
+        move_head_ver=comp_ver.get('move_head', 'default'),
     ).to(device)
     model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
@@ -422,7 +427,7 @@ def main():
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
                         num_workers=args.num_workers, pin_memory=False,
                         prefetch_factor=2 if args.num_workers > 0 else None,
-                        persistent_workers=args.num_workers > 0,
+                        persistent_workers=args.num_workers > 0)
     print(f"[DATA] {len(ds):,} examples → {len(loader):,} batches")
 
     # Run

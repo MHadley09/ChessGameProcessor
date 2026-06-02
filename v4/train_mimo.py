@@ -11,9 +11,18 @@ Features:
     - Learnable uncertainty-based multi-task loss weighting
     - Gradient clipping
     - Single forward pass with built-in masking (no double forward pass)
-    - TensorBoard logging
+    - TensorBoard logging with per-head loss and accuracy metrics
     - Proper checkpoint saving (best + latest + periodic)
     - Reproducible with --seed
+
+V4 has 4 independent heads: move_logits, mistake_prob, win_prob_before, time_spent.
+Per-epoch reports include per-head losses and accuracies for each head.
+
+Future V5 consideration:
+    Currently the expert heads share the trunk and cannot be independently
+    recombined from different checkpoints. A V5 parallel-training variant
+    could train each expert head in isolation with frozen shared encoders,
+    enabling best-weight mixing per head.
 
 Usage (sharded — preferred):
     python train_mimo.py \
@@ -258,6 +267,10 @@ def validate(model, loader, criterion, device, use_amp):
     total_moves = 0
     mistake_correct = 0
     mistake_total = 0
+    wdl_correct = 0
+    wdl_total = 0
+    time_abs_err_sum = 0.0
+    time_total = 0
 
     for batch in loader:
         cp = batch['current_planes'].to(device, non_blocking=True)
@@ -301,6 +314,20 @@ def validate(model, loader, criterion, device, use_amp):
         mistake_correct += (mistake_pred == targets['is_mistake']).float().sum().item()
         mistake_total += len(targets['is_mistake'])
 
+        # WDL before accuracy
+        if 'win_prob_before' in outputs and 'win_prob_before' in targets:
+            wdl_pred = outputs['win_prob_before'].argmax(dim=-1)
+            wdl_true = targets['win_prob_before'].argmax(dim=-1)
+            wdl_correct += (wdl_pred == wdl_true).sum().item()
+            wdl_total += wdl_true.numel()
+
+        # Time MAE
+        if 'time_spent' in outputs:
+            time_pred = outputs['time_spent'].squeeze(-1)
+            time_true = targets['time_spent_log']
+            time_abs_err_sum += torch.abs(time_pred - time_true).sum().item()
+            time_total += time_true.numel()
+
     avg_loss = running_loss / max(n_batches, 1)
     avg_comp = {k: v / max(n_batches, 1) for k, v in running_components.items()}
     metrics = {
@@ -309,6 +336,8 @@ def validate(model, loader, criterion, device, use_amp):
         'move_top3': correct_top3 / max(total_moves, 1),
         'move_top5': correct_top5 / max(total_moves, 1),
         'mistake_acc': mistake_correct / max(mistake_total, 1),
+        'wdl_before_acc': wdl_correct / max(wdl_total, 1),
+        'time_mae': time_abs_err_sum / max(time_total, 1),
     }
     return avg_loss, metrics, avg_comp
 
@@ -338,6 +367,15 @@ def main():
     parser.add_argument('--cnn-channels', type=int, default=128)
     parser.add_argument('--res-blocks', type=int, default=6)
     parser.add_argument('--hidden-dim', type=int, default=256)
+    # --- Component versions (registry) ---
+    parser.add_argument('--mistake-expert-ver', type=str, default='default',
+                        help='Expert architecture for mistake head (see register_expert)')
+    parser.add_argument('--time-expert-ver', type=str, default='default',
+                        help='Expert architecture for time head')
+    parser.add_argument('--wdl-expert-ver', type=str, default='default',
+                        help='Expert architecture for WDL head')
+    parser.add_argument('--move-head-ver', type=str, default='default',
+                        help='Move head architecture (see register_move_head)')
     # --- Data loading ---
     parser.add_argument('--num-workers', type=int, default=2,
                         help='DataLoader workers (2 default on Windows 32GB; try 4 on 64GB+ or Linux)')
@@ -417,12 +455,17 @@ def main():
         tabular_dim=18,
         max_possible=args.max_possible,
         hidden_dim=args.hidden_dim,
+        mistake_expert_ver=args.mistake_expert_ver,
+        time_expert_ver=args.time_expert_ver,
+        wdl_expert_ver=args.wdl_expert_ver,
+        move_head_ver=args.move_head_ver,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\n[MODEL] ChessMIMOModelV4 — {n_params:,} parameters")
     print(f"        CNN channels={args.cnn_channels}, res_blocks={args.res_blocks}, "
           f"hidden={args.hidden_dim}, max_moves={args.max_possible}")
+    print(f"        Versions: {model.component_versions}")
 
     # ---- ONNX Runtime Training (ORTModule) ----
     if args.use_ort:
@@ -500,6 +543,7 @@ def main():
 
     # ---- Save config ----
     config = vars(args)
+    config['component_versions'] = model.component_versions
     config['n_params'] = n_params
     config['train_examples'] = len(train_ds)
     config['val_examples'] = len(val_ds)
@@ -532,10 +576,26 @@ def main():
 
         lr_now = scheduler.lr
         print(f"\nEpoch {epoch}/{args.epochs}  ({elapsed:.0f}s)  lr={lr_now:.2e}")
-        print(f"  TRAIN loss={train_loss:.4f}  move_acc={train_acc:.3f}")
+        # Train summary with per-head losses
+        train_loss_str = f"  TRAIN loss={train_loss:.4f}  move_acc={train_acc:.3f}"
+        for head in ['move_logits','mistake_prob','win_prob_before','time_spent']:
+            if head in train_comp:
+                train_loss_str += f"  {head}={train_comp[head]:.4f}"
+        print(train_loss_str)
+
+        # Val summary with per-head losses and accuracies
         print(f"  VAL   loss={val_loss:.4f}  top1={val_metrics['move_top1']:.3f}  "
               f"top3={val_metrics['move_top3']:.3f}  top5={val_metrics['move_top5']:.3f}  "
-              f"mistake_acc={val_metrics['mistake_acc']:.3f}")
+              f"mistake_acc={val_metrics['mistake_acc']:.3f}  "
+              f"wdl_acc={val_metrics.get('wdl_before_acc',0):.3f}  "
+              f"time_mae={val_metrics.get('time_mae',0):.3f}")
+
+        # Per-head val losses
+        val_loss_str = '  LOSSES'
+        for head in ['move_logits','mistake_prob','win_prob_before','time_spent']:
+            if head in val_comp:
+                val_loss_str += f"  {head}={val_comp[head]:.4f}"
+        print(val_loss_str)
 
         # Task weights
         weights_str = '  '.join(
@@ -553,10 +613,17 @@ def main():
             writer.add_scalar('Acc/move_top1', val_metrics['move_top1'], epoch)
             writer.add_scalar('Acc/move_top3', val_metrics['move_top3'], epoch)
             writer.add_scalar('Acc/mistake', val_metrics['mistake_acc'], epoch)
+            writer.add_scalar('Acc/wdl_before', val_metrics.get('wdl_before_acc',0), epoch)
+            writer.add_scalar('Reg/time_mae', val_metrics.get('time_mae',0), epoch)
             writer.add_scalar('LR', lr_now, epoch)
             for k, v in val_comp.items():
                 if k.startswith('w_'):
                     writer.add_scalar(f'Weights/{k}', v, epoch)
+            for head in ['move_logits','mistake_prob','win_prob_before','time_spent']:
+                if head in val_comp:
+                    writer.add_scalar(f'Loss/val_{head}', val_comp[head], epoch)
+                if f'train_{head}' in entry:
+                    writer.add_scalar(f'Loss/train_{head}', entry[f'train_{head}'], epoch)
 
         # Checkpointing
         ckpt = {

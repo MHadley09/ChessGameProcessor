@@ -476,6 +476,7 @@ class MIMOPredictor:
         print(f"Loading checkpoint: {checkpoint_path}")
         ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         cfg = ckpt.get('config', {})
+        comp_ver = cfg.get('component_versions', {})
 
         self.model = ChessMIMOModelV4(
             cnn_channels=cfg.get('cnn_channels', 128),
@@ -483,6 +484,10 @@ class MIMOPredictor:
             tabular_dim=18,
             max_possible=cfg.get('max_possible', 220),
             hidden_dim=cfg.get('hidden_dim', 256),
+            mistake_expert_ver=comp_ver.get('mistake_expert', 'default'),
+            time_expert_ver=comp_ver.get('time_expert', 'default'),
+            wdl_expert_ver=comp_ver.get('wdl_expert', 'default'),
+            move_head_ver=comp_ver.get('move_head', 'default'),
         ).to(self.device)
         state_dict = ckpt['model_state_dict']
         # Strip _orig_mod. prefix added by torch.compile() wrapping
