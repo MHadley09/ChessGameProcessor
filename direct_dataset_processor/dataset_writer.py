@@ -10,26 +10,24 @@ and all possible_move records at once. It then:
   3. Buffers examples and flushes to NPZ shards at configurable intervals
 
 Output structure:
-    output_dir/train/shard_wXX_XXXX.npz
-    output_dir/val/shard_wXX_XXXX.npz
-    output_dir/test/shard_wXX_XXXX.npz
+    output_dir/train/shard_wXX_YYYYMMDD_HHMMSS_XXXX.npz
+    output_dir/val/shard_wXX_YYYYMMDD_HHMMSS_XXXX.npz
+    output_dir/test/shard_wXX_YYYYMMDD_HHMMSS_XXXX.npz
 
 Shard format matches dataset_v4.py exactly:
     fen_before, game_to_position, possible_uci, possible_fen_after,
-    possible_scalars (13-dim: ..., is_mistake_move, is_excellent_move),
-    possible_mask, tabular (20-dim: ..., frac_mistake_moves, frac_excellent_moves),
-    actual_idx, is_mistake, win_prob_before, time_spent_log
-
-Mistake definition: EV = W*1.0 + D*0.5 + L*0.0 from side-to-move perspective.
-  - Mistake: EV drop from best move > 0.25
-  - Excellent: EV drop from best move < 0.025, or IS the best move
+    possible_scalars, possible_mask, tabular, actual_idx, is_mistake,
+    win_prob_before, time_spent_log
 """
 
 import gc
+import glob
 import math
 import os
+import re
 import threading
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -68,6 +66,38 @@ def _safe_float(val, default: float = 0.0) -> float:
         return float(val)
     except (ValueError, TypeError):
         return default
+
+
+def _compute_game_phase(board: chess.Board, move_dict: Dict) -> int:
+    """
+    Compute game phase: 0=opening, 1=middlegame, 2=endgame.
+    
+    Opening: ply <= 14 (move 7) AND not in endgame material.
+    Endgame: material-based — no queens on board, OR total non-pawn
+             material (knights, bishops, rooks) <= 3 pieces combined.
+    Middlegame: everything else.
+    """
+    ply = int(_safe_float(move_dict.get('move_no'), 0))
+
+    # Count material
+    queens = len(board.pieces(chess.QUEEN, chess.WHITE)) + len(board.pieces(chess.QUEEN, chess.BLACK))
+    minors_majors = (len(board.pieces(chess.KNIGHT, chess.WHITE)) +
+                     len(board.pieces(chess.BISHOP, chess.WHITE)) +
+                     len(board.pieces(chess.ROOK, chess.WHITE)) +
+                     len(board.pieces(chess.KNIGHT, chess.BLACK)) +
+                     len(board.pieces(chess.BISHOP, chess.BLACK)) +
+                     len(board.pieces(chess.ROOK, chess.BLACK)))
+
+    # Endgame: no queens, or very low material
+    if queens == 0 or (queens == 0 and minors_majors <= 3):
+        return 2
+
+    # Opening: ply <= 14 (move 7)
+    if ply <= 14:
+        return 0
+
+    # Middlegame
+    return 1
 
 
 def parse_time_control(tc) -> Tuple[float, float]:
@@ -153,7 +183,7 @@ def build_example(
         legal_move_info[uci] = (board.is_check(), board.is_checkmate())
         board.pop()
 
-    poss_scalars = np.zeros((max_possible, 13), dtype=np.float32)
+    poss_scalars = np.zeros((max_possible, 12), dtype=np.float32)
     poss_uci_list = []
     poss_fen_after_list = []
     piece_map = {'P': 1/6, 'N': 2/6, 'B': 3/6, 'R': 4/6, 'Q': 5/6, 'K': 1.0}
@@ -207,8 +237,7 @@ def build_example(
             is_capture,
             is_check,
             is_checkmate,
-            0.0,  # is_mistake_move — filled after EV computation
-            0.0,  # is_excellent_move — filled after EV computation
+            0.0,  # policy_prob — unused, always 0
         ]
 
     # Pad UCI/FEN lists
@@ -241,42 +270,6 @@ def build_example(
         num_checks = 0.0
     num_candidates = num_possible / max_possible
 
-    # ------------------------------------------------------------------
-    # STM Expected Value + per-move mistake/excellent flags
-    # EV = win * 1.0 + draw * 0.5 + loss * 0.0 (from side-to-move perspective)
-    # WDL in poss_scalars slots 1-3 are white_win%, draw%, black_win% on 0-100
-    # ------------------------------------------------------------------
-    is_mistake = 0.0
-    frac_mistake_moves = 0.0
-    frac_excellent_moves = 0.0
-
-    if num_possible > 0:
-        # Compute STM expected value for each candidate move
-        w_pcts = poss_scalars[:num_possible, 1] / 100.0  # white win prob 0-1
-        d_pcts = poss_scalars[:num_possible, 2] / 100.0  # draw prob 0-1
-        l_pcts = poss_scalars[:num_possible, 3] / 100.0  # black win prob 0-1
-
-        if is_white:
-            stm_evs = w_pcts + 0.5 * d_pcts
-        else:
-            stm_evs = l_pcts + 0.5 * d_pcts
-
-        best_idx = int(np.argmax(stm_evs))
-        best_ev = stm_evs[best_idx]
-        drops = best_ev - stm_evs  # EV drop from best, per move
-
-        # Per-move flags
-        for i in range(num_possible):
-            poss_scalars[i, 11] = 1.0 if drops[i] > 0.25 else 0.0   # is_mistake_move
-            poss_scalars[i, 12] = 1.0 if (drops[i] < 0.025 or i == best_idx) else 0.0  # is_excellent_move
-
-        frac_mistake_moves = float(poss_scalars[:num_possible, 11].sum()) / num_possible
-        frac_excellent_moves = float(poss_scalars[:num_possible, 12].sum()) / num_possible
-
-        # Is the actually played move a mistake?
-        if actual_idx >= 0:
-            is_mistake = 1.0 if drops[actual_idx] > 0.25 else 0.0
-
     tabular = np.array([
         _safe_float(move_dict.get('time_remaining')) / 3600.0,
         w_elo / 3000.0,
@@ -296,9 +289,86 @@ def build_example(
         num_captures,
         num_checks,
         num_candidates,
-        frac_mistake_moves,
-        frac_excellent_moves,
     ], dtype=np.float32)
+
+    # Mistake detection + per-move classification
+    is_mistake = 0.0
+    frac_mistake_moves = 0.0
+    frac_excellent_moves = max(1.0 / num_possible, 0.0) if num_possible > 0 else 0.0  # minimum 1
+
+    if actual_idx >= 0 and num_possible > 0:
+        def _expected_score_stm(pm_dict):
+            """Expected score from side-to-move perspective (0-100 scale)."""
+            w = _safe_float(pm_dict.get('white_win_perc'), 33.0)
+            d = _safe_float(pm_dict.get('draw_perc'), 34.0)
+            white_es = w + 0.5 * d
+            return white_es if is_white else (100.0 - white_es)
+
+        best_idx = max(range(num_possible), key=lambda i: _expected_score_stm(possibles[i]))
+        best_es = _expected_score_stm(possibles[best_idx])
+        played_es = _expected_score_stm(possibles[actual_idx])
+        drop = best_es - played_es
+        avg_elo = (w_elo + b_elo) / 2
+        # Thresholds on 0-100 scale to match WDL percentages
+        threshold = 20.0 if avg_elo < 1500 else (15.0 if avg_elo < 2500 else 10.0)
+        if drop > threshold:
+            is_mistake = 1.0
+
+        if drop > 5.0 and is_mistake == 0.0:
+            def _outcome_class_stm(pm_dict):
+                """Outcome class from STM perspective: 2=winning, 1=drawing, 0=losing."""
+                w = _safe_float(pm_dict.get('white_win_perc'), 33.0)
+                d = _safe_float(pm_dict.get('draw_perc'), 34.0)
+                l = _safe_float(pm_dict.get('black_win_perc'), 33.0)
+                if is_white:
+                    mx = max(w, d, l)
+                    if mx == w: return 2
+                    elif mx == d: return 1
+                    return 0
+                else:
+                    mx = max(w, d, l)
+                    if mx == l: return 2   # Black winning
+                    elif mx == d: return 1
+                    return 0
+            if _outcome_class_stm(possibles[actual_idx]) < _outcome_class_stm(possibles[best_idx]):
+                is_mistake = 1.0
+
+        # Classify all legal moves for frac features
+        n_excellent = 0
+        n_mistake = 0
+        for j in range(num_possible):
+            j_es = _expected_score_stm(possibles[j])
+            j_drop = best_es - j_es
+            j_mistake = False
+            if j_drop > threshold:
+                j_mistake = True
+            elif j_drop > 5.0:
+                def _oc_stm(pm_dict):
+                    w = _safe_float(pm_dict.get('white_win_perc'), 33.0)
+                    d = _safe_float(pm_dict.get('draw_perc'), 34.0)
+                    l = _safe_float(pm_dict.get('black_win_perc'), 33.0)
+                    if is_white:
+                        mx = max(w, d, l)
+                        if mx == w: return 2
+                        elif mx == d: return 1
+                        return 0
+                    else:
+                        mx = max(w, d, l)
+                        if mx == l: return 2
+                        elif mx == d: return 1
+                        return 0
+                if _oc_stm(possibles[j]) < _oc_stm(possibles[best_idx]):
+                    j_mistake = True
+            if j_mistake:
+                n_mistake += 1
+            elif j_drop <= 2.0:
+                n_excellent += 1
+
+        frac_mistake_moves = n_mistake / num_possible
+        frac_excellent_moves = max(n_excellent, 1) / num_possible
+
+    # Append frac_mistake_moves and frac_excellent_moves to tabular (slots 18, 19)
+    tabular = np.append(tabular, [frac_mistake_moves, frac_excellent_moves]).astype(np.float32)
 
     wdl_before = result_to_wdl(game_result)
     raw_ts = max(0.0, _safe_float(move_dict.get('time_spent')))
@@ -320,36 +390,7 @@ def build_example(
     }
 
     if with_phase:
-        game_phase = 1  # default middlegame
-        try:
-            ply = int(_safe_float(move_dict.get('move_no'), 0))
-            if ply <= 10:
-                # Opening: first 10 half-moves (5 full moves)
-                game_phase = 0
-            else:
-                # Endgame detection from FEN piece placement
-                pieces = fen_before.split()[0]
-                white_pieces = 0  # non-pawn non-king for white
-                black_pieces = 0  # non-pawn non-king for black
-                num_pawns = 0
-                for ch in pieces:
-                    if ch in 'NBRQ':
-                        white_pieces += 1
-                    elif ch in 'nbrq':
-                        black_pieces += 1
-                    elif ch in 'Pp':
-                        num_pawns += 1
-                # Endgame if ANY of:
-                #   1. Both sides have ≤ 2 non-pawn non-king pieces
-                #   2. Fewer than 3 total non-pawn non-king pieces
-                #   3. No pawns on the board
-                total_pieces = white_pieces + black_pieces
-                if ((white_pieces <= 2 and black_pieces <= 2)
-                        or total_pieces < 3
-                        or num_pawns == 0):
-                    game_phase = 2
-        except Exception:
-            pass
+        game_phase = _compute_game_phase(board, move_dict)
         result['game_phase'] = np.int64(game_phase)
 
     return result
@@ -378,11 +419,11 @@ class DatasetWriter:
         output_dir: str,
         worker_id: int = 0,
         max_possible: int = 220,
-        shard_size: int = 250_000,
+        shard_size: int = 5_000,
         val_pct: int = 10,
         test_pct: int = 10,
         with_phase: bool = False,
-        run_tag: str = "",
+        run_timestamp: Optional[str] = None,
     ):
         self.output_dir = Path(output_dir)
         self.worker_id = worker_id
@@ -391,19 +432,25 @@ class DatasetWriter:
         self.val_pct = val_pct
         self.test_pct = test_pct
         self.with_phase = with_phase
-        self.run_tag = run_tag
+        self.run_timestamp = run_timestamp or datetime.now().strftime('%Y%m%d_%H%M%S')
 
         # Create split directories
         for split in ('train', 'val', 'test'):
             (self.output_dir / split).mkdir(parents=True, exist_ok=True)
 
-        # Per-split flat buffers and shard counters.
-        self._buffers: Dict[str, List[Dict]] = {
+        # Per-split buffers: list of game chunks (each chunk is one game's examples).
+        # Flushing always cuts at game boundaries so all moves from one game
+        # stay in the same shard.
+        self._buffers: Dict[str, List[List[Dict]]] = {
             'train': [], 'val': [], 'test': [],
         }
-        self._shard_counters: Dict[str, int] = {
+        self._buffer_lens: Dict[str, int] = {
             'train': 0, 'val': 0, 'test': 0,
         }
+        # Scan existing shards to avoid overwriting previous runs
+        self._shard_counters: Dict[str, int] = {}
+        for split in ('train', 'val', 'test'):
+            self._shard_counters[split] = self._next_shard_id(split)
         self._lock = threading.Lock()
 
         # Counters
@@ -411,6 +458,26 @@ class DatasetWriter:
         self.moves_written = 0
         self.examples_written = 0
         self.possible_moves_written = 0
+
+    def _next_shard_id(self, split: str) -> int:
+        """Scan existing shards for this worker in the split directory
+        and return the next available shard ID to prevent overwrites."""
+        split_dir = self.output_dir / split
+        if not split_dir.exists():
+            return 0
+        max_id = -1
+        pattern = re.compile(
+            rf'^shard_w{self.worker_id:02d}_\d{{8}}_\d{{6}}_(\d{{4}})\.npz$'
+        )
+        # Also match old format without timestamp for backward compat
+        pattern_old = re.compile(
+            rf'^shard_w{self.worker_id:02d}_(\d{{4}})\.npz$'
+        )
+        for f in os.listdir(split_dir):
+            m = pattern.match(f) or pattern_old.match(f)
+            if m:
+                max_id = max(max_id, int(m.group(1)))
+        return max_id + 1
 
     def _get_split(self, game_hash: str) -> str:
         """Deterministic train/val/test split from game hash."""
@@ -492,33 +559,43 @@ class DatasetWriter:
         if not game_examples:
             return
 
-        # Commit: all examples built successfully, append to flat buffer
+        # Commit: all examples built successfully, add to shard buffer
         with self._lock:
-            self._buffers[split].extend(game_examples)
+            self._buffers[split].append(game_examples)
+            self._buffer_lens[split] += len(game_examples)
             self.games_written += 1
             self.moves_written += len(move_records)
             self.examples_written += len(game_examples)
             self.possible_moves_written += len(possible_move_records)
 
-            # Flush if buffer exceeds shard size
-            if len(self._buffers[split]) >= self.shard_size:
-                self._flush_shard(split, self._buffers[split])
-                self._buffers[split] = []
+            # Flush when buffer has enough games (shard_size = games per shard)
+            for s in ('train', 'val', 'test'):
+                while len(self._buffers[s]) >= self.shard_size:
+                    shard_games = self._buffers[s][:self.shard_size]
+                    self._buffers[s] = self._buffers[s][self.shard_size:]
+                    flat = [e for game in shard_games for e in game]
+                    self._buffer_lens[s] -= len(flat)
+                    self._flush_shard(s, flat)
 
     def _flush_shard(self, split: str, examples: List[Dict]):
         """Write a list of examples to a compressed NPZ shard.
 
-        Atomic write: data is written to a _tmp.npz file first, then
+        Atomic write: data is written to a .tmp file first, then
         os.replace()'d to the final name. This prevents corrupt partial
         NPZ files if the process crashes mid-write.
+
+        All examples from the same game are always in the same shard
+        (buffer is game-chunked, flush cuts at game boundaries).
         """
         if not examples:
             return
 
         shard_id = self._shard_counters[split]
-        prefix = f'{self.run_tag}_' if self.run_tag else ''
-        shard_path = self.output_dir / split / f'{prefix}shard_w{self.worker_id:02d}_{shard_id:04d}.npz'
-        tmp_path = shard_path.parent / f'{shard_path.stem}_tmp.npz'
+        shard_path = self.output_dir / split / f'shard_w{self.worker_id:02d}_{self.run_timestamp}_{shard_id:04d}.npz'
+        # np.savez_compressed auto-appends .npz if missing, so use a .tmp
+        # file without .npz suffix and let numpy create .tmp.npz
+        tmp_stem = shard_path.parent / f'.tmp_w{self.worker_id:02d}_{self.run_timestamp}_{shard_id:04d}'
+        tmp_actual = tmp_stem.parent / f'{tmp_stem.name}.npz'  # what numpy will create
 
         save_dict = {
             'fen_before': np.array([e['fen_before'] for e in examples], dtype=object),
@@ -536,8 +613,8 @@ class DatasetWriter:
         if self.with_phase:
             save_dict['game_phase'] = np.array([e.get('game_phase', 0) for e in examples])
 
-        np.savez_compressed(tmp_path, **save_dict)
-        os.replace(tmp_path, shard_path)
+        np.savez_compressed(str(tmp_stem), **save_dict)
+        os.replace(str(tmp_actual), str(shard_path))
 
         sz_mb = os.path.getsize(shard_path) / (1024 * 1024)
         print(
@@ -555,8 +632,10 @@ class DatasetWriter:
         with self._lock:
             for split in ('train', 'val', 'test'):
                 if self._buffers[split]:
-                    self._flush_shard(split, self._buffers[split])
+                    flat = [e for game in self._buffers[split] for e in game]
+                    self._flush_shard(split, flat)
                     self._buffers[split] = []
+                    self._buffer_lens[split] = 0
 
     def close(self):
         """Flush and finalize."""

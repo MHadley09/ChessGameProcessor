@@ -10,7 +10,7 @@ Key LC0 settings for all-legal-moves coverage:
   - PerPVCounters=True: each PV builds its own search tree
   - SmartPruningFactor=0: no pruning of unpromising moves
   - FpuStrategy=absolute, FpuValue=0: neutral first-play urgency
-  - CPuct=5.0: heavy exploration bias
+  - CPuct=100.0: maximum exploration bias to ensure all legal moves get visited
   - PolicyTemperature=10.0: flatten policy for uniform coverage
 
 Node budget per position:
@@ -80,8 +80,6 @@ class BatchLC0Evaluator:
         min_nodes: int = 1,
         max_nodes: int = 0,
         nodes_mult: float = 1.0,
-        use_exploration_settings: bool = True,
-        time_per_move_ms: Optional[float] = None,
     ):
         self.lc0_path = lc0_path
         self.weights_path = weights_path
@@ -91,8 +89,6 @@ class BatchLC0Evaluator:
         self.min_nodes = min_nodes
         self.max_nodes = max_nodes
         self.nodes_mult = nodes_mult
-        self.use_exploration_settings = use_exploration_settings
-        self.time_per_move_ms = time_per_move_ms
         self._engine: Optional[chess.engine.SimpleEngine] = None
 
     def _compute_node_limit(self, n_legal: int) -> int:
@@ -103,34 +99,24 @@ class BatchLC0Evaluator:
         return node_limit
 
     def start(self):
-        """Start the LC0 engine process."""
+        """Start the LC0 engine process with all-legal-moves exploration settings."""
         self._engine = chess.engine.SimpleEngine.popen_uci(
             self.lc0_path,
             timeout=60,
         )
-        config = {
+        self._engine.configure({
             "WeightsFile": self.weights_path,
             "Backend": self.backend,
             "MinibatchSize": self.batch_size,
             "Threads": self.threads,
             "UCI_ShowWDL": True,
-        }
-        if self.use_exploration_settings:
-            # Exotic settings for all-legal-moves coverage:
-            # flat policy, max exploration, independent PV counters
-            config.update({
-                "PerPVCounters": True,
-                "SmartPruningFactor": 0,
-                "FpuStrategy": "absolute",
-                "FpuValue": 0,
-                "CPuct": 5.0,
-                "PolicyTemperature": 10.0,
-            })
-        # When use_exploration_settings=False, LC0 keeps its defaults:
-        #   PerPVCounters=False, SmartPruningFactor=1.33,
-        #   FpuStrategy=reduction/0.44, CPuct=2.15, PolicyTemperature=1.61
-        # Node budget via "go nodes N" works reliably with defaults.
-        self._engine.configure(config)
+            "PerPVCounters": True,
+            "SmartPruningFactor": 0,
+            "FpuStrategy": "absolute",
+            "FpuValue": 0,
+            "CPuct": 100.0,
+            "PolicyTemperature": 10.0,
+        })
 
     def evaluate_position(
         self, board: chess.Board, multipv: int = 1
@@ -264,14 +250,11 @@ class BatchLC0Evaluator:
                 "fen_after": board_copy.fen(),
             }
 
-        if self.time_per_move_ms is not None:
-            limit = chess.engine.Limit(time=self.time_per_move_ms / 1000.0)
-        else:
-            limit = chess.engine.Limit(nodes=self._compute_node_limit(n_legal))
+        node_limit = self._compute_node_limit(n_legal)
         infos = self._engine.analyse(
             board,
-            limit,
-            multipv=n_legal,
+            chess.engine.Limit(nodes=node_limit),
+            multipv=MAX_LEGAL_MOVES,
             info=chess.engine.INFO_ALL,
         )
 
@@ -406,6 +389,13 @@ class SyncBatchEvaluator:
 
     def quit(self):
         self._evaluator.quit()
+
+    def is_alive(self) -> bool:
+        return self._evaluator._engine is not None
+
+    def restart(self):
+        self._evaluator.quit()
+        self._evaluator.start()
 
     def __enter__(self):
         self.start()

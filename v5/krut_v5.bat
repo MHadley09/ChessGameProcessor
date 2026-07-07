@@ -1,0 +1,2 @@
+@echo off
+python "C:\Users\micha\Personal\School\DEng\dissertation\mutation\ChessGameProcessor\v5\mimo_uci_engine.py" --lc0 "C:\Users\micha\Personal\Coding\chess-clone\lc0\lc0.exe" --lc0-weights "C:\Users\micha\Personal\School\DEng\dissertation\mutation\ChessGameProcessor\weights\large.pb.gz" --checkpoint "C:\Users\micha\Personal\School\DEng\dissertation\mutation\ChessGameProcessor\checkpoints\v5-widehead\best.pt"

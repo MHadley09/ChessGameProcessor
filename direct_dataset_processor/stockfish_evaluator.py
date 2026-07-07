@@ -1,14 +1,14 @@
 """
-DirectLC0Evaluator — Direct UCI subprocess wrapper for LC0.
+DirectStockfishEvaluator — Direct UCI subprocess wrapper for Stockfish.
 
-Bypasses python-chess's engine wrapper to minimize per-call overhead.
-Communicates with LC0 via raw stdin/stdout UCI protocol, parsing info
-lines with simple string splitting instead of rich object construction.
+Same interface and return format as DirectLC0Evaluator / SyncDirectEvaluator.
+Uses MultiPV to evaluate all legal moves in a single search call.
+Supports depth, nodes, and time-based search limits (configurable).
 
-Drop-in replacement for BatchLC0Evaluator / SyncBatchEvaluator.
-Same evaluate_all_legal_moves() return format.
+No GPU required — runs on CPU, so you can run many more workers in parallel
+than with LC0.
 
-Typical overhead: ~1-2ms per call vs ~8-12ms with python-chess.
+Drop-in replacement: same evaluate_all_legal_moves() return format.
 """
 
 import subprocess
@@ -17,45 +17,48 @@ import chess
 from typing import List, Dict, Optional
 
 
-class DirectLC0Evaluator:
+class DirectStockfishEvaluator:
     """
-    LC0 evaluator using direct UCI subprocess communication.
+    Stockfish evaluator using direct UCI subprocess communication.
 
-    Supports both node-based and time-based search limits.
-    Parses UCI info lines directly for minimal overhead.
+    Evaluates all legal moves via MultiPV. Supports configurable search
+    limits: depth, nodes, and/or movetime. If multiple are set, Stockfish
+    stops at whichever limit is reached first.
+
+    Returns the same format as DirectLC0Evaluator for pipeline compatibility.
     """
 
     def __init__(
         self,
-        lc0_path: str,
-        weights_path: str,
-        backend: str = "cuda-fp16",
-        batch_size: int = 256,
+        stockfish_path: str,
         threads: int = 1,
-        min_nodes: int = 1,
+        hash_mb: int = 128,
+        max_depth: int = 0,
         max_nodes: int = 0,
-        nodes_mult: float = 1.0,
-        use_exploration_settings: bool = True,
-        time_per_move_ms: Optional[float] = None,
+        movetime_ms: int = 0,
+        # Accepted but ignored — keeps interface compatible with LC0 worker args
+        lc0_path: str = "",
+        weights_path: str = "",
+        backend: str = "",
+        batch_size: int = 0,
+        min_nodes: int = 0,
+        nodes_mult: float = 0,
     ):
-        self.lc0_path = lc0_path
-        self.weights_path = weights_path
-        self.backend = backend
-        self.batch_size = batch_size
+        self.stockfish_path = stockfish_path
         self.threads = threads
-        self.min_nodes = min_nodes
+        self.hash_mb = hash_mb
+        self.max_depth = max_depth
         self.max_nodes = max_nodes
-        self.nodes_mult = nodes_mult
-        self.use_exploration_settings = use_exploration_settings
-        self.time_per_move_ms = time_per_move_ms
+        self.movetime_ms = movetime_ms
+
         self._proc: Optional[subprocess.Popen] = None
         self._stderr_thread: Optional[threading.Thread] = None
-        self._multipv_set: Optional[int] = None  # track current MultiPV to avoid resending
+        self._multipv_set: Optional[int] = None
 
     def start(self):
-        """Start the LC0 engine process and configure UCI options."""
+        """Start the Stockfish engine process and configure UCI options."""
         self._proc = subprocess.Popen(
-            [self.lc0_path],
+            [self.stockfish_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -63,30 +66,19 @@ class DirectLC0Evaluator:
             bufsize=1,
         )
 
-        # Drain stderr in background so it doesn't block
         self._stderr_thread = threading.Thread(
             target=self._drain_stderr, daemon=True
         )
         self._stderr_thread.start()
 
-        # Wait for UCI handshake
+        # UCI handshake
         self._send("uci")
         self._read_until("uciok")
 
-        # Set options
-        self._set_option("WeightsFile", self.weights_path)
-        self._set_option("Backend", self.backend)
-        self._set_option("MinibatchSize", str(self.batch_size))
+        # Configure
         self._set_option("Threads", str(self.threads))
+        self._set_option("Hash", str(self.hash_mb))
         self._set_option("UCI_ShowWDL", "true")
-
-        if self.use_exploration_settings:
-            self._set_option("PerPVCounters", "true")
-            self._set_option("SmartPruningFactor", "0")
-            self._set_option("FpuStrategy", "absolute")
-            self._set_option("FpuValue", "0")
-            self._set_option("CPuct", "100.0")
-            self._set_option("PolicyTemperature", "10.0")
 
         self._send("isready")
         self._read_until("readyok")
@@ -111,37 +103,30 @@ class DirectLC0Evaluator:
         self._send(f"setoption name {name} value {value}")
 
     def _read_until(self, stop_token: str) -> List[str]:
-        """Read stdout lines until a line starts with stop_token. Returns all lines."""
+        """Read stdout lines until a line starts with stop_token."""
         lines = []
         while True:
             line = self._proc.stdout.readline().strip()
             if not line and self._proc.poll() is not None:
-                raise RuntimeError("LC0 process terminated unexpectedly")
+                raise RuntimeError("Stockfish process terminated unexpectedly")
             lines.append(line)
             if line.startswith(stop_token):
                 break
         return lines
 
-    def _compute_node_limit(self, n_legal: int) -> int:
-        """Compute node budget: clamp(n_legal * nodes_mult, min_nodes, max_nodes)."""
-        node_limit = max(self.min_nodes, int(n_legal * self.nodes_mult))
-        if self.max_nodes > 0:
-            node_limit = min(node_limit, self.max_nodes)
-        return node_limit
-
     @staticmethod
     def _parse_info_line(line: str) -> Optional[Dict]:
         """Parse a UCI info line into a dict.
 
-        Example:
-          info depth 1 seldepth 0 time 0 nodes 1 score cp -7413 wdl 1 0 999
-               tbhits 0 multipv 1 pv a7a5 e1a1
-
         Returns dict with: multipv, depth, nodes, score_cp, score_mate,
                            wdl_w, wdl_d, wdl_l, pv (list of UCI moves).
-        Returns None if the line isn't a valid info line.
+        Returns None if the line isn't a valid info line with a PV.
         """
         if not line.startswith("info "):
+            return None
+
+        # Skip "info string" lines
+        if line.startswith("info string"):
             return None
 
         tokens = line.split()
@@ -167,6 +152,9 @@ class DirectLC0Evaluator:
                 except ValueError:
                     pass
                 i += 2
+
+            elif tok == "seldepth" and i + 1 < len(tokens):
+                i += 2  # skip
 
             elif tok == "nodes" and i + 1 < len(tokens):
                 try:
@@ -199,10 +187,10 @@ class DirectLC0Evaluator:
                 try:
                     w = int(tokens[i + 1])
                     d = int(tokens[i + 2])
-                    l = int(tokens[i + 3])
+                    l_ = int(tokens[i + 3])
                     result["wdl_w"] = w / 1000.0
                     result["wdl_d"] = d / 1000.0
-                    result["wdl_l"] = l / 1000.0
+                    result["wdl_l"] = l_ / 1000.0
                 except ValueError:
                     pass
                 i += 4
@@ -214,7 +202,7 @@ class DirectLC0Evaluator:
             else:
                 i += 1
 
-        # Only return if we got a PV (skip string/bound info lines)
+        # Only return if we got a PV
         if not result["pv"]:
             return None
 
@@ -222,10 +210,13 @@ class DirectLC0Evaluator:
 
     def evaluate_all_legal_moves(self, board: chess.Board) -> List[Dict]:
         """
-        Evaluate EVERY legal move in ONE engine call via direct UCI.
+        Evaluate EVERY legal move via MultiPV search.
 
-        Pipelined: sends go command FIRST, then pre-computes SAN/fen_after
-        while the GPU evaluates. Overlaps ~1-2ms of CPU work with GPU eval.
+        Uses the same approach as DirectLC0Evaluator: sets MultiPV to
+        the number of legal moves, runs a single search, collects results.
+
+        Search limits are configurable: depth, nodes, movetime.
+        If none are set, defaults to depth 14.
 
         Returns a list of dicts, one per legal move:
             {
@@ -255,17 +246,23 @@ class DirectLC0Evaluator:
             self._set_option("MultiPV", str(n_legal))
             self._multipv_set = n_legal
 
-        # Send position + go command — GPU starts evaluating NOW
+        # Send position
         self._send(f"position fen {board.fen()}")
 
-        if self.time_per_move_ms is not None:
-            self._send(f"go movetime {int(self.time_per_move_ms)}")
-        else:
-            node_limit = self._compute_node_limit(n_legal)
-            self._send(f"go nodes {node_limit}")
+        # Build go command with configured limits
+        go_parts = ["go"]
+        if self.max_depth > 0:
+            go_parts.append(f"depth {self.max_depth}")
+        if self.max_nodes > 0:
+            go_parts.append(f"nodes {self.max_nodes}")
+        if self.movetime_ms > 0:
+            go_parts.append(f"movetime {self.movetime_ms}")
+        # Default: depth 14 if nothing else is set
+        if len(go_parts) == 1:
+            go_parts.append("depth 14")
+        self._send(" ".join(go_parts))
 
-        # Pre-compute SAN and fen_after WHILE GPU evaluates (overlapped)
-        # Pipe buffers LC0's info line output (~3.5KB for 35 moves)
+        # Pre-compute SAN and fen_after while engine searches
         move_info = {}
         for move in legal_moves:
             try:
@@ -279,11 +276,11 @@ class DirectLC0Evaluator:
                 "fen_after": board_copy.fen(),
             }
 
-        # Collect response (GPU output already buffered in pipe)
+        # Collect response
         lines = self._read_until("bestmove")
 
         # Parse info lines — keep only the LAST info per multipv
-        # (LC0 may emit intermediate updates at increasing depths)
+        # (Stockfish emits updates at increasing depths)
         pv_infos = {}
         for line in lines:
             parsed = self._parse_info_line(line)
@@ -339,7 +336,7 @@ class DirectLC0Evaluator:
             }
             results.append(entry)
 
-        # Fallback for missed moves (shouldn't happen with exploration settings)
+        # Fallback for any missed moves
         for move in legal_moves:
             uci = move.uci()
             if uci not in seen_moves:
@@ -372,7 +369,7 @@ class DirectLC0Evaluator:
         return results
 
     def quit(self):
-        """Shut down the LC0 process."""
+        """Shut down the Stockfish process."""
         if self._proc:
             try:
                 self._send("quit")
@@ -385,11 +382,11 @@ class DirectLC0Evaluator:
             self._proc = None
 
     def is_alive(self) -> bool:
-        """Check if the LC0 subprocess is still running."""
+        """Check if the Stockfish subprocess is still running."""
         return self._proc is not None and self._proc.poll() is None
 
     def restart(self):
-        """Kill and restart the LC0 engine process."""
+        """Kill and restart the Stockfish engine process."""
         self.quit()
         self.start()
 
@@ -401,11 +398,23 @@ class DirectLC0Evaluator:
         self.quit()
 
 
-class SyncDirectEvaluator:
-    """Drop-in replacement for SyncBatchEvaluator using direct UCI."""
+class SyncStockfishEvaluator:
+    """Drop-in replacement for SyncDirectEvaluator / SyncBatchEvaluator using Stockfish."""
 
-    def __init__(self, *args, **kwargs):
-        self._evaluator = DirectLC0Evaluator(*args, **kwargs)
+    def __init__(self, stockfish_path: str, threads: int = 1, hash_mb: int = 128,
+                 max_depth: int = 0, max_nodes: int = 0, movetime_ms: int = 0,
+                 # Ignored LC0 compat args
+                 lc0_path: str = "", weights_path: str = "", backend: str = "",
+                 batch_size: int = 0, min_nodes: int = 0, nodes_mult: float = 0,
+                 max_nodes_lc0: int = 0):
+        self._evaluator = DirectStockfishEvaluator(
+            stockfish_path=stockfish_path,
+            threads=threads,
+            hash_mb=hash_mb,
+            max_depth=max_depth,
+            max_nodes=max_nodes,
+            movetime_ms=movetime_ms,
+        )
 
     def start(self):
         self._evaluator.start()
